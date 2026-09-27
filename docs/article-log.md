@@ -42,3 +42,16 @@
 - 3並行ワーカーで実装：①`flake.nix`+`hosts/t480s/`、②`modules/`+`home/`+sops関連、③CI workflow+テスト+README
 - 実装後、計画のIn-session Verification Steps 1〜7（相対パス解決・flakeアトリビュート整合・識別子束縛・シークレット混入・リモート未作成・GitButler履歴確認など）をすべて実行し通過を確認。特に`hosts/t480s/configuration.nix`が元ファイルとの差分で「imports追加・hostname変更・experimental-features追加」の3点のみであること、`hardware-configuration.nix`がバイト同一であることを`git show <baseline>`との比較で確認した
 - オンマシンでの実際の`nix flake check`実行・`nixos-rebuild`実行は未実施（Non-Goal）。README記載の手順をユーザーが実機で試す段階
+
+## GitHub公開・運用フェーズ
+
+- ユーザーが自身でGitHubリポジトリ（`furubese/my-nixos-git-t480s`）を作成・push。ローカルの作業ディレクトリも`my-nixos-git-t480s`に改名
+- Cachixの`CACHIX_AUTH_TOKEN`をGitHub Actions Secretsに登録。チャットに一時的に貼られたトークンは無効化・再発行し、新しいものを登録する運用にした（秘密情報をチャットや履歴に残さない判断の徹底）
+- `check-light.yml`/`check-desktop.yml`のCachixキャッシュ名プレースホルダーを実名（`nixos-furubese-t480s-5gb`）に置換
+
+## 追加機能：zsh + oh-my-zsh のNix管理化
+
+- デフォルトシェルをzshにし、oh-my-zshを導入したいという要望を受け、システム側（ログインシェル切り替え・`/etc/shells`登録）とユーザー側（oh-my-zshのテーマ・プラグイン等）を分離して設計
+  - 理由：ログインシェルの変更はシステム全体に影響するためNixOSモジュール（`modules/shell.nix`）に、oh-my-zshの中身は個人設定なのでHome Manager（`home/fse.nix`）に、と責務を分けた
+- `modules/shell.nix`を新規追加し`hosts/t480s/configuration.nix`からimport。`home/fse.nix`に`programs.zsh.oh-my-zsh`設定を追加
+- CIの`paths`フィルタを`modules/packages.nix`単体から`modules/**`に広げた（新しいモジュールを追加するたびに個別列挙するのは壊れやすいため）
