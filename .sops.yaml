@@ -1,0 +1,9 @@
+# Template - replace the placeholder age recipient below with your real one after
+# running: age-keygen -o ~/.config/sops/age/keys.txt
+keys:
+  - &user_fse age1_REPLACE_WITH_YOUR_AGE_PUBLIC_KEY
+creation_rules:
+  - path_regex: secrets/secrets\.yaml$
+    key_groups:
+      - age:
+          - *user_fse

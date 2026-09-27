@@ -1,0 +1,11 @@
+result
+result-*
+.direnv
+*.age
+keys.txt
+age-key*
+*.key
+.sops-key*
+
+# Deep Interview / planning artifacts: not part of the NixOS config, kept local only
+.omc/

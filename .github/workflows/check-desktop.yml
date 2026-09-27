@@ -1,0 +1,19 @@
+# modules/desktop.nix は今回未実装のスタブのため、このワークフローは
+# pull_request では自動起動しない（Spec Amendment #4）。
+# 手動トリガー（workflow_dispatch）のみで、実行ステップも無害化している。
+on:
+  workflow_dispatch:
+
+jobs:
+  desktop-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+      - name: フルデスクトップ起動テスト（未実装のためスキップ）
+        # nix build .#checks.x86_64-linux.desktop-full -L
+        run: echo "modules/desktop.nix未実装のためスキップ"
