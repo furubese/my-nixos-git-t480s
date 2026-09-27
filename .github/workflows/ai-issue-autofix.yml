@@ -1,0 +1,181 @@
+name: AI Issue Autofix
+
+# セキュリティ/設計メモ:
+# - workflow_run はトリガー元(check-light.yml)が何をしていようと、常にデフォルトブランチ(main)上の
+#   このワークフロー定義で実行される。ai/packages-issue-* ブランチ側がこのファイルを書き換えても
+#   権限昇格はできない。
+# - ai/packages-issue-* ブランチ以外（人間が作った通常のPR）では絶対に発火しないよう、
+#   ブランチ名のパターンをジョブレベルで確認する。
+# - 失敗原因（パッケージ名の問題か、Cachix認証やネットワーク等のインフラ的な問題か）は区別しない。
+#   意図的なシンプル設計（Deep Interview Round 4のContrarian検討で確認済み）。
+#   無駄な試行がAPI課金・時間を消費するリスクは承知の上で許容している。
+# - 修正ロジック自体は ai-issue-handler.yml と同じ安全設計を再利用する：AIにはNixコードを一切
+#   生成させず、JSON配列のパッケージ名リストのみを出力させ、識別子パターンで検証してから
+#   固定テンプレートでファイルを再構築する。issue本文・CIログは信頼できない入力として扱い、
+#   env: 経由で渡す（run: ブロックへの直接埋め込みはしない）。
+on:
+  workflow_run:
+    # ここは check-light.yml の name: フィールドと完全一致させること（ファイル名ではない）
+    workflows: ["check-light"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  autofix:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      startsWith(github.event.workflow_run.head_branch, 'ai/packages-issue-')
+    runs-on: ubuntu-latest
+    env:
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: 試行回数を確認（mainからの先行コミット数で判定）
+        id: attempts
+        run: |
+          count=$(git rev-list --count origin/main..HEAD)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "現在のコミット数（初回生成分を含む）: $count"
+          # count=1: 初回生成のみ、まだ修正0回。count=4: 既に修正3回実施済み。
+          # count > 3 の場合、既に3回の修正を試行済みなので、これ以上は試さない。
+          if [ "$count" -gt 3 ]; then
+            echo "exhausted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 試行上限に達した場合、PRにコメントしてエスカレーション
+        if: steps.attempts.outputs.exhausted == 'true'
+        run: |
+          pr_number=$(gh pr list --head "$HEAD_BRANCH" --json number -q '.[0].number')
+          if [ -n "$pr_number" ]; then
+            gh pr comment "$pr_number" --body "自動修正を3回試みましたが、check-light.yml が引き続き失敗しています。これ以上の自動修正は行いません。人間によるレビュー・修正をお願いします（実行ログ: ${{ github.event.workflow_run.html_url }}）。"
+          fi
+          exit 0
+
+      - name: 失敗ログを取得
+        if: steps.attempts.outputs.exhausted == 'false'
+        run: |
+          gh run view "$RUN_ID" --log-failed > /tmp/failure_log.txt || true
+          # ログが極端に大きい場合に備えて末尾のみ使う（プロンプト肥大化を避ける）
+          tail -n 200 /tmp/failure_log.txt > /tmp/failure_log_tail.txt
+
+      - name: OpenRouter (GLM 5.3) に修正後のパッケージリスト生成を依頼し、検証して反映
+        if: steps.attempts.outputs.exhausted == 'false'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          current = open("modules/packages.nix", encoding="utf-8").read()
+          failure_log = open("/tmp/failure_log_tail.txt", encoding="utf-8", errors="replace").read()
+          api_key = os.environ["OPENROUTER_API_KEY"]
+
+          prompt = f"""あなたはNixOS設定リポジトリの modules/packages.nix を修正するアシスタントです。
+          以下のパッケージリストでビルドを試みたところ、CIが失敗しました。
+          Nixコードは絶対に出力しないでください。出力は「修正後の完全なパッケージ名リスト」を表す
+          JSON配列の文字列のみとしてください（例: ["git", "htop"]）。
+          説明文・コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと。
+
+          --- 現在の modules/packages.nix ---
+          {current}
+
+          --- CI失敗ログ（末尾200行） ---
+          {failure_log}
+
+          失敗の原因が読み取れる場合はそれに対応する形（例：存在しないパッケージ名を除去・修正）で
+          パッケージ名リストを修正してください。原因が読み取れない場合は、現在のリストから
+          最も疑わしい変更点を1つ取り除いたリストを出力してください。
+          """
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": "z-ai/glm-5.3",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0,
+              }).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(req, timeout=60) as resp:
+              response = json.load(resp)
+
+          raw = response["choices"][0]["message"]["content"].strip()
+          print(f"AI raw response: {raw}")
+
+          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+          if fence_match:
+              raw = fence_match.group(1).strip()
+
+          try:
+              packages = json.loads(raw)
+          except json.JSONDecodeError:
+              print(f"::error::AIの応答がJSON配列として解釈できません: {raw!r}")
+              sys.exit(1)
+
+          if not isinstance(packages, list) or not packages:
+              print("::error::AIの応答が空、またはリスト形式ではありません。中断します。")
+              sys.exit(1)
+
+          safe = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+          for p in packages:
+              if not isinstance(p, str) or not safe.match(p):
+                  print(f"::error::安全でないパッケージ名が含まれています: {p!r}。中断します。")
+                  sys.exit(1)
+
+          packages = sorted(set(packages))
+          pkg_list = " ".join(packages)
+
+          new_content = (
+              "# AI-EDITABLE: パッケージ追加はこのリスト内のみで行うこと\n"
+              "{ pkgs, ... }:\n"
+              "{\n"
+              f"  environment.systemPackages = with pkgs; [ {pkg_list} ];\n"
+              "}\n"
+          )
+          open("modules/packages.nix", "w", encoding="utf-8").write(new_content)
+          print(f"modules/packages.nix updated with: {pkg_list}")
+          PYEOF
+
+      - name: 変更が modules/packages.nix のみであることを検証
+        if: steps.attempts.outputs.exhausted == 'false'
+        run: |
+          changed=$(git diff --name-only)
+          echo "変更されたファイル: $changed"
+          if [ -z "$changed" ]; then
+            echo "::error::AIが何も変更しませんでした。中断します。"
+            exit 1
+          fi
+          if [ "$changed" != "modules/packages.nix" ]; then
+            echo "::error::modules/packages.nix 以外のファイルが変更されたため中断します: $changed"
+            exit 1
+          fi
+
+      - name: 修正コミットを同じPRブランチにpush
+        if: steps.attempts.outputs.exhausted == 'false'
+        run: |
+          git config user.name "ai-issue-handler[bot]"
+          git config user.email "ai-issue-handler@users.noreply.github.com"
+          git add modules/packages.nix
+          git commit -m "packages: autofix attempt after CI failure (run ${{ github.event.workflow_run.id }})"
+          git push origin "HEAD:$HEAD_BRANCH"

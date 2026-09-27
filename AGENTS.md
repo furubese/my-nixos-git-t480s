@@ -64,6 +64,17 @@ material for a written article about building it — see "Article log" below).
   regex, or the file-scope check without discussing the security implications with the repo
   owner first: this workflow spends real API credits and opens real PRs from untrusted issue
   text.
+- `.github/workflows/ai-issue-autofix.yml` reruns the same AI when `check-light`'s
+  `workflow_run` completes with `conclusion == 'failure'` on an `ai/packages-issue-*` branch. It
+  does **not** distinguish "wrong package name" from "unrelated CI flake" — that's a deliberate
+  simplicity choice from the spec at `.omc/specs/deep-interview-ci-autofix-loop.md`, not a gap to
+  "fix" by adding failure-classification logic. Attempt count is derived from
+  `git rev-list --count origin/main..HEAD` on the branch (no external state store); the cap is 3
+  fix attempts, after which it posts a PR comment and stops instead of retrying forever. The
+  `workflows:` list in its `on.workflow_run` trigger must match `check-light.yml`'s `name:`
+  field exactly — if you ever rename that workflow, update this trigger too, or autofix silently
+  stops firing. Same untrusted-input rules apply here as in `ai-issue-handler.yml` (CI log
+  content goes through a file, never interpolated into `run:`).
 
 ## Testing without a local Nix install
 
