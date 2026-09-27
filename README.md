@@ -123,20 +123,25 @@ GitHubリモートを作成しこのリポジトリを公開する前に、以�
 
 ## AI駆動のIssue→PR自動化（`ai-issue-handler.yml`）
 
-`package-request`ラベルが付いたissueをトリガーに、AI（Claude Code）が`modules/packages.nix`を編集し、
-自動でPRを作成する仕組みです。
+`package-request`ラベルが付いたissueをトリガーに、AI（OpenRouter経由の`z-ai/glm-5.3`）が
+`modules/packages.nix`を編集し、自動でPRを作成する仕組みです。
 
-- **セットアップ**：Anthropic Console（https://console.anthropic.com/ ）でAPIキーを発行し、
-  GitHub Secretsに`ANTHROPIC_API_KEY`として登録してください（Claude.ai/Claude Codeのサブスクリプションとは
-  別の従量課金契約です）。チャットやコミットに絶対に貼らないこと。
+- **セットアップ**：https://openrouter.ai/ でアカウントを作成し、`API Keys`からキーを発行してください。
+  クレジットのチャージが必要です。GitHub Secretsに`OPENROUTER_API_KEY`として登録してください
+  （`gh secret set OPENROUTER_API_KEY`でも可）。**チャットやコミットに絶対に貼らないこと。**
 - **トリガー条件**：issueに`package-request`ラベルが付与された時のみ実行されます。GitHubのデフォルト権限では
   ラベル付与にtriage/write権限が必要なため、公開リポジトリで誰でも作成できるissue本文だけでは起動しません。
-- **安全策**：AIには`modules/packages.nix`の編集のみを許可し（`Bash`ツールは与えない）、ワークフロー側で
-  差分が本当にそのファイルだけかを機械的に検証してから、コミット・push・PR作成を行います（AIの出力を
-  信用せず、確定的な処理で担保する設計）。
-- **未検証の前提**：`claude --print`/`--allowedTools`の挙動はstory.mdの元案を踏襲していますが、この
-  開発環境にはGitHub Actionsを実行する手段が無く、実際に動かして確認できていません。初回はテスト用issueで
-  試し、想定通り動くか確認することを推奨します。
+- **安全策（2段構え）**：
+  1. AIにはNixコードを一切生成させない。「追加後の完全なパッケージ名リスト」をJSON配列としてのみ出力させ、
+     各要素を安全な識別子パターン（`git`, `python3Packages.numpy`のような形）で検証したうえで、
+     ワークフロー側が固定テンプレートに埋め込んでファイルを再構築する。検証に失敗する要素が一つでもあれば
+     ジョブ全体を中断する（AIの出力を直接コードとして書き込むことはない）
+  2. その上で、変更されたファイルが`modules/packages.nix`だけであることも機械的に再確認する
+  3. issue本文・タイトルは信頼できない入力として扱い、シェルスクリプトへの直接埋め込みではなく
+     環境変数経由でPythonスクリプトに渡している（コマンドインジェクション対策）
+- **未検証の前提**：この開発環境にはGitHub Actionsを実行する手段が無く、実際にOpenRouter APIを呼び出して
+  動作確認はできていません（バリデーションロジック自体は単体でテスト済み）。初回はテスト用issueで試し、
+  想定通り動くか確認することを推奨します。
 - **レビュー必須**：作成されるPRの本文にも明記していますが、AI生成の変更は必ず人間がレビューしてから
   マージしてください。`check-light.yml`のビルド検証も併せて確認すること。
 

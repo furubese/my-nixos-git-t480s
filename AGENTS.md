@@ -52,12 +52,18 @@ material for a written article about building it — see "Article log" below).
   is a real, working module that's actually imported.
 - `.github/workflows/ai-issue-handler.yml` runs on `issues: labeled` and is gated on the
   `package-request` label (adding a label requires triage/write repo access, which is what
-  keeps a public repo's issue tracker from being an open trigger). The AI step is only allowed
-  the `Edit` tool — no `Bash` — and a separate deterministic step verifies the diff touches
-  **only** `modules/packages.nix` before anything gets committed or pushed. Don't loosen
-  either constraint (the label gate or the file-scope check) without discussing the security
-  implications with the repo owner first: this workflow spends real API credits and opens
-  real PRs from untrusted issue text.
+  keeps a public repo's issue tracker from being an open trigger). It calls OpenRouter
+  (`z-ai/glm-5.3`), not the Claude Code CLI — that's a deliberate choice, not an oversight, so
+  don't "helpfully" switch it back. The model is never allowed to generate Nix code or touch
+  the filesystem: it must return a JSON array of package names, each validated against a strict
+  identifier pattern before the workflow rebuilds `modules/packages.nix` from a fixed template.
+  A separate deterministic step then re-verifies the diff touches **only**
+  `modules/packages.nix`. Issue title/body are untrusted input and are passed via `env:`, never
+  interpolated directly into a `run:` shell block (that's a real GitHub Actions script-injection
+  vector, not a style preference). Don't loosen the label gate, the package-name validation
+  regex, or the file-scope check without discussing the security implications with the repo
+  owner first: this workflow spends real API credits and opens real PRs from untrusted issue
+  text.
 
 ## Testing without a local Nix install
 
