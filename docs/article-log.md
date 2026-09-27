@@ -55,3 +55,9 @@
   - 理由：ログインシェルの変更はシステム全体に影響するためNixOSモジュール（`modules/shell.nix`）に、oh-my-zshの中身は個人設定なのでHome Manager（`home/fse.nix`）に、と責務を分けた
 - `modules/shell.nix`を新規追加し`hosts/t480s/configuration.nix`からimport。`home/fse.nix`に`programs.zsh.oh-my-zsh`設定を追加
 - CIの`paths`フィルタを`modules/packages.nix`単体から`modules/**`に広げた（新しいモジュールを追加するたびに個別列挙するのは壊れやすいため）
+
+## テスト→PRフローの確認（Deep Interview 2回目）
+
+- 「Nixコード変更はテストを通してからPRを出してほしい」という要望を受けて短いDeep Interviewを実施。調査の結果、`check-light.yml`が既に`pull_request`トリガーで自動テストを実行する設計になっており、要望の大部分は既に満たされていることが判明
+- GitHub Branch protection（必須ステータスチェック）による強制ブロックも検討したが、`check-light.yml`がpathsフィルタ付きのため、Nixコードを含まないPR（AGENTS.mdのみ等）に同じ必須チェックをかけると永久に判定待ちになりマージ不能になるという既知の落とし穴が判明。ユーザーの判断でブロック機構は導入しないことに決定
+- 曖昧度8%で早期収束（新規実装が不要と分かったため、omc-planコンセンサスは経由せず直接実行）。`feat-zsh-ohmyzsh`（PR #1）と`docs-agents-md`（PR #2）を実際にPR化し、動作を確認する運びとした
