@@ -50,9 +50,14 @@ material for a written article about building it — see "Article log" below).
   currently an unimported stub, so a `pull_request` trigger on it would be a guaranteed-red
   check on a public repo. Only add a `pull_request` trigger back once `modules/desktop.nix`
   is a real, working module that's actually imported.
-- `.github/workflows/ai-issue-handler.yml` **does not exist and should not be added** without
-  the repo owner explicitly asking for it — this was a deliberate, confirmed decision (not an
-  oversight), deferring `story.md`'s AI-driven Issue→PR automation to a later stage.
+- `.github/workflows/ai-issue-handler.yml` runs on `issues: labeled` and is gated on the
+  `package-request` label (adding a label requires triage/write repo access, which is what
+  keeps a public repo's issue tracker from being an open trigger). The AI step is only allowed
+  the `Edit` tool — no `Bash` — and a separate deterministic step verifies the diff touches
+  **only** `modules/packages.nix` before anything gets committed or pushed. Don't loosen
+  either constraint (the label gate or the file-scope check) without discussing the security
+  implications with the repo owner first: this workflow spends real API credits and opens
+  real PRs from untrusted issue text.
 
 ## Testing without a local Nix install
 
