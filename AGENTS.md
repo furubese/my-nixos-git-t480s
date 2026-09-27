@@ -50,9 +50,31 @@ material for a written article about building it — see "Article log" below).
   currently an unimported stub, so a `pull_request` trigger on it would be a guaranteed-red
   check on a public repo. Only add a `pull_request` trigger back once `modules/desktop.nix`
   is a real, working module that's actually imported.
-- `.github/workflows/ai-issue-handler.yml` **does not exist and should not be added** without
-  the repo owner explicitly asking for it — this was a deliberate, confirmed decision (not an
-  oversight), deferring `story.md`'s AI-driven Issue→PR automation to a later stage.
+- `.github/workflows/ai-issue-handler.yml` runs on `issues: labeled` and is gated on the
+  `package-request` label (adding a label requires triage/write repo access, which is what
+  keeps a public repo's issue tracker from being an open trigger). It calls OpenRouter
+  (`z-ai/glm-5.3`), not the Claude Code CLI — that's a deliberate choice, not an oversight, so
+  don't "helpfully" switch it back. The model is never allowed to generate Nix code or touch
+  the filesystem: it must return a JSON array of package names, each validated against a strict
+  identifier pattern before the workflow rebuilds `modules/packages.nix` from a fixed template.
+  A separate deterministic step then re-verifies the diff touches **only**
+  `modules/packages.nix`. Issue title/body are untrusted input and are passed via `env:`, never
+  interpolated directly into a `run:` shell block (that's a real GitHub Actions script-injection
+  vector, not a style preference). Don't loosen the label gate, the package-name validation
+  regex, or the file-scope check without discussing the security implications with the repo
+  owner first: this workflow spends real API credits and opens real PRs from untrusted issue
+  text.
+- `.github/workflows/ai-issue-autofix.yml` reruns the same AI when `check-light`'s
+  `workflow_run` completes with `conclusion == 'failure'` on an `ai/packages-issue-*` branch. It
+  does **not** distinguish "wrong package name" from "unrelated CI flake" — that's a deliberate
+  simplicity choice from the spec at `.omc/specs/deep-interview-ci-autofix-loop.md`, not a gap to
+  "fix" by adding failure-classification logic. Attempt count is derived from
+  `git rev-list --count origin/main..HEAD` on the branch (no external state store); the cap is 3
+  fix attempts, after which it posts a PR comment and stops instead of retrying forever. The
+  `workflows:` list in its `on.workflow_run` trigger must match `check-light.yml`'s `name:`
+  field exactly — if you ever rename that workflow, update this trigger too, or autofix silently
+  stops firing. Same untrusted-input rules apply here as in `ai-issue-handler.yml` (CI log
+  content goes through a file, never interpolated into `run:`).
 
 ## Testing without a local Nix install
 

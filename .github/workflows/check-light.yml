@@ -1,3 +1,5 @@
+name: check-light
+
 on:
   pull_request:
     paths: ['hosts/**', 'modules/**', 'flake.nix', 'flake.lock', 'home/**', 'tests/**']

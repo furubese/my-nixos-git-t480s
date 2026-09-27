@@ -1,0 +1,160 @@
+name: AI Issue Handler
+
+# セキュリティ設計:
+# - トリガーは `labeled` イベントのみ。GitHubのデフォルト権限では、issueへのラベル付与には
+#   triage/write権限が必要なため、公開リポジトリで誰でも作成できる issue 本文だけでは
+#   このワークフローは起動しない（`package-request` ラベルを付けられる=信頼できる人だけが起動できる）。
+# - issue本文・タイトルは信頼できない入力として扱う。シェルの `run:` ブロックに直接
+#   `${{ github.event.issue.body }}` を埋め込まない（コマンドインジェクションの原因になるため）。
+#   必ず `env:` 経由で渡し、スクリプト側で変数として読む。
+# - AI（OpenRouter経由のGLM 5.3）にはNixコードそのものを生成させない。
+#   「追加後の完全なパッケージ名リスト（JSON配列の文字列）」だけを出力させ、各要素を
+#   安全な識別子パターンで検証したうえで、ワークフロー側が固定テンプレートに埋め込んで
+#   modules/packages.nix を再構築する。AIの出力を直接コードとして書き込むことは一切ない。
+# - ブランチ作成・コミット・push・PR作成はすべて確定的な処理（AIには渡さない）。
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  ai-edit:
+    if: github.event.label.name == 'package-request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 作業ブランチを作成
+        run: git checkout -b "ai/packages-issue-${{ github.event.issue.number }}"
+
+      - name: OpenRouter (GLM 5.3) にパッケージリストの生成を依頼し、検証して反映
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          current = open("modules/packages.nix", encoding="utf-8").read()
+          issue_title = os.environ.get("ISSUE_TITLE", "")
+          issue_body = os.environ.get("ISSUE_BODY", "")
+          api_key = os.environ["OPENROUTER_API_KEY"]
+
+          prompt = f"""あなたはNixOS設定リポジトリの modules/packages.nix を更新するアシスタントです。
+          Nixコードは絶対に出力しないでください。出力は「追加後の完全なパッケージ名リスト」を表す
+          JSON配列の文字列のみとしてください（例: ["git", "htop", "ripgrep"]）。
+          説明文・コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと。
+
+          --- issueタイトル ---
+          {issue_title}
+
+          --- issue本文 ---
+          {issue_body}
+
+          --- 現在の modules/packages.nix ---
+          {current}
+
+          issueの内容から読み取れる追加パッケージを、既存のパッケージ名リストに追加した
+          「完全なパッケージ名リスト」をJSON配列として出力してください。
+          パッケージ名が一つも読み取れない場合は、既存のリストをそのまま出力してください。
+          """
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": "z-ai/glm-5.3",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0,
+              }).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(req, timeout=60) as resp:
+              response = json.load(resp)
+
+          raw = response["choices"][0]["message"]["content"].strip()
+          print(f"AI raw response: {raw}")
+
+          # コードフェンスで囲まれて返ってきた場合に備えて剥がす（無害化のための前処理であり、
+          # これによって内容の安全性チェックを省略してよいわけではない）
+          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+          if fence_match:
+              raw = fence_match.group(1).strip()
+
+          try:
+              packages = json.loads(raw)
+          except json.JSONDecodeError:
+              print(f"::error::AIの応答がJSON配列として解釈できません: {raw!r}")
+              sys.exit(1)
+
+          if not isinstance(packages, list) or not packages:
+              print("::error::AIの応答が空、またはリスト形式ではありません。中断します。")
+              sys.exit(1)
+
+          # nixpkgs属性名として妥当な形（ドット区切りの識別子）のみ許可。
+          # これ以外の文字（; " ' $ ( ) 改行 等）を含む要素は一件でもあれば全体を拒否する。
+          safe = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+          for p in packages:
+              if not isinstance(p, str) or not safe.match(p):
+                  print(f"::error::安全でないパッケージ名が含まれています: {p!r}。中断します。")
+                  sys.exit(1)
+
+          packages = sorted(set(packages))
+          pkg_list = " ".join(packages)
+
+          new_content = (
+              "# AI-EDITABLE: パッケージ追加はこのリスト内のみで行うこと\n"
+              "{ pkgs, ... }:\n"
+              "{\n"
+              f"  environment.systemPackages = with pkgs; [ {pkg_list} ];\n"
+              "}\n"
+          )
+          open("modules/packages.nix", "w", encoding="utf-8").write(new_content)
+          print(f"modules/packages.nix updated with: {pkg_list}")
+          PYEOF
+
+      - name: 変更が modules/packages.nix のみであることを検証
+        run: |
+          changed=$(git diff --name-only)
+          echo "変更されたファイル: $changed"
+          if [ -z "$changed" ]; then
+            echo "::error::変更がありませんでした。issue内容からパッケージ名を認識できなかった可能性があります。"
+            exit 1
+          fi
+          if [ "$changed" != "modules/packages.nix" ]; then
+            echo "::error::modules/packages.nix 以外のファイルが変更されたため中断します: $changed"
+            exit 1
+          fi
+
+      - name: コミット・push・PR作成
+        run: |
+          git config user.name "ai-issue-handler[bot]"
+          git config user.email "ai-issue-handler@users.noreply.github.com"
+          git add modules/packages.nix
+          git commit -m "packages: address #${{ github.event.issue.number }} (AI-generated, needs review)"
+          git push origin "ai/packages-issue-${{ github.event.issue.number }}"
+          gh pr create \
+            --title "packages: address #${{ github.event.issue.number }}" \
+            --body "issue #${{ github.event.issue.number }} からAI（OpenRouter経由のGLM 5.3）が自動生成した変更です。
+
+          AIが生成したのはパッケージ名リスト（JSON配列）のみで、Nixコード自体はワークフローが
+          固定テンプレートで組み立てています。それでも **マージ前に必ず人間がレビューしてください。**
+          \`check-light.yml\` の通過（Nixビルド検証）も確認すること。
+
+          Closes #${{ github.event.issue.number }}" \
+            --base main \
+            --head "ai/packages-issue-${{ github.event.issue.number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

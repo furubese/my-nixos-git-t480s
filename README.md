@@ -121,9 +121,51 @@ GitHubリモートを作成しこのリポジトリを公開する前に、以�
 - [ ] `secrets/` 配下に平文の実秘密が含まれていない（`secrets.yaml.example` はテンプレートなので問題ない）
 - [ ] `git remote -v` にGitHub等の外部リモートが存在しない（GitButlerが自動追加する `gb-local` は問題ない、想定通り）
 
+## AI駆動のIssue→PR自動化（`ai-issue-handler.yml`）
+
+`package-request`ラベルが付いたissueをトリガーに、AI（OpenRouter経由の`z-ai/glm-5.3`）が
+`modules/packages.nix`を編集し、自動でPRを作成する仕組みです。
+
+- **セットアップ**：https://openrouter.ai/ でアカウントを作成し、`API Keys`からキーを発行してください。
+  クレジットのチャージが必要です。GitHub Secretsに`OPENROUTER_API_KEY`として登録してください
+  （`gh secret set OPENROUTER_API_KEY`でも可）。**チャットやコミットに絶対に貼らないこと。**
+- **トリガー条件**：issueに`package-request`ラベルが付与された時のみ実行されます。GitHubのデフォルト権限では
+  ラベル付与にtriage/write権限が必要なため、公開リポジトリで誰でも作成できるissue本文だけでは起動しません。
+- **安全策（2段構え）**：
+  1. AIにはNixコードを一切生成させない。「追加後の完全なパッケージ名リスト」をJSON配列としてのみ出力させ、
+     各要素を安全な識別子パターン（`git`, `python3Packages.numpy`のような形）で検証したうえで、
+     ワークフロー側が固定テンプレートに埋め込んでファイルを再構築する。検証に失敗する要素が一つでもあれば
+     ジョブ全体を中断する（AIの出力を直接コードとして書き込むことはない）
+  2. その上で、変更されたファイルが`modules/packages.nix`だけであることも機械的に再確認する
+  3. issue本文・タイトルは信頼できない入力として扱い、シェルスクリプトへの直接埋め込みではなく
+     環境変数経由でPythonスクリプトに渡している（コマンドインジェクション対策）
+- **未検証の前提**：この開発環境にはGitHub Actionsを実行する手段が無く、実際にOpenRouter APIを呼び出して
+  動作確認はできていません（バリデーションロジック自体は単体でテスト済み）。初回はテスト用issueで試し、
+  想定通り動くか確認することを推奨します。
+- **レビュー必須**：作成されるPRの本文にも明記していますが、AI生成の変更は必ず人間がレビューしてから
+  マージしてください。`check-light.yml`のビルド検証も併せて確認すること。
+
+## CI失敗時の自動修正（`ai-issue-autofix.yml`）
+
+`ai-issue-handler.yml`が作ったPR（`ai/packages-issue-*`ブランチ）で`check-light`が失敗した場合、
+自動でAIに再修正させ、同じPRブランチに修正コミットをpushする仕組みです。
+
+- **トリガー**：`workflow_run`イベント。`check-light`が完了し`conclusion == 'failure'`、かつ
+  対象ブランチが`ai/packages-issue-`で始まる場合のみ発火します（人間の通常PRには反応しません）
+- **試行上限**：最大3回まで。判定はPRブランチのコミット数（`git rev-list --count origin/main..HEAD`）
+  で行い、外部の状態ストアは使いません。3回を超えて失敗する場合はPRにコメントを付けて自動修正を打ち切り、
+  人間のレビューに委ねます
+- **意図的な単純さ**：失敗原因が「パッケージ名の問題」か「Cachix認証やネットワーク等の無関係な問題」かは
+  区別しません（Deep Interviewでのユーザーの明示的な判断）。無関係な原因では3回とも無駄になりますが、
+  それによるAPI課金・時間のコストは許容範囲として受け入れています
+- **安全策**：`ai-issue-handler.yml`と同じ設計を踏襲（AIはJSON配列のパッケージ名のみ出力、識別子検証、
+  ファイルスコープの差分再確認、CIログはファイル経由で渡し`run:`ブロックに直接埋め込まない）
+- **注意**：`on.workflow_run.workflows`は`check-light.yml`の`name:`フィールド（`check-light`）と
+  完全一致させる必要があります。ワークフロー名を変更した場合はこちらも忘れず更新してください
+- **未検証**：これも同じ理由（この開発環境でGitHub Actionsを実行できない）で実地確認はできていません
+
 ## 未実装・既知の制限事項
 
-- AI駆動のIssue→PR自動化（`ai-issue-handler.yml`）はこのセッションでは実装していない
 - GitHubリモート作成・Cachix接続はこのセッションでは行っていない
 - `check-desktop.yml` は手動トリガー（`workflow_dispatch`）専用。`modules/desktop.nix` が未実装のスタブのため、PRで自動実行されないようにしている
 - `check-light.yml` は `CACHIX_AUTH_TOKEN` が未設定の間、Cachixのステップで失敗する（想定通りであり、バグではない）
