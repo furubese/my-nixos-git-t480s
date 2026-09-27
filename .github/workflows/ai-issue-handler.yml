@@ -1,0 +1,71 @@
+name: AI Issue Handler
+
+# セキュリティ設計:
+# - トリガーは `labeled` イベントのみ。GitHubのデフォルト権限では、issueへのラベル付与には
+#   triage/write権限が必要なため、公開リポジトリで誰でも作成できる issue 本文だけでは
+#   このワークフローは起動しない（`package-request` ラベルを付けられる=信頼できる人だけが起動できる）。
+# - AIエージェント（Claude Code）には `modules/packages.nix` の編集のみをさせ、
+#   ブランチ作成・コミット・push・PR作成はワークフロー側の確定的な処理で行う。
+#   AIの出力（issue本文に対する応答）を信用せず、差分を機械的に検証してから使う。
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  ai-edit:
+    if: github.event.label.name == 'package-request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 作業ブランチを作成
+        run: git checkout -b "ai/packages-issue-${{ github.event.issue.number }}"
+
+      - name: AIにmodules/packages.nixの編集のみを依頼
+        run: |
+          claude --print "以下はGitHub issueの本文です。この内容から読み取れるNixパッケージ名を
+          modules/packages.nix の environment.systemPackages リストに追記してください。
+          既存の記述形式・インデント・コメントは変更しないこと。他のファイルは一切編集しないこと。
+          パッケージ名が読み取れない場合は何も変更しないこと。
+
+          --- issue本文 ---
+          ${{ github.event.issue.body }}" \
+          --allowedTools "Edit"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: 変更が modules/packages.nix のみであることを機械的に検証
+        run: |
+          changed=$(git diff --name-only)
+          echo "変更されたファイル: $changed"
+          if [ -z "$changed" ]; then
+            echo "::error::AIが何も変更しませんでした（パッケージ名を認識できなかった可能性があります）。issue本文を見直してください。"
+            exit 1
+          fi
+          if [ "$changed" != "modules/packages.nix" ]; then
+            echo "::error::modules/packages.nix 以外のファイルが変更されたため中断します: $changed"
+            exit 1
+          fi
+
+      - name: コミット・push・PR作成
+        run: |
+          git config user.name "ai-issue-handler[bot]"
+          git config user.email "ai-issue-handler@users.noreply.github.com"
+          git add modules/packages.nix
+          git commit -m "packages: address #${{ github.event.issue.number }} (AI-generated, needs review)"
+          git push origin "ai/packages-issue-${{ github.event.issue.number }}"
+          gh pr create \
+            --title "packages: address #${{ github.event.issue.number }}" \
+            --body "issue #${{ github.event.issue.number }} からAIが自動生成した変更です。
+
+          **マージ前に必ず人間がレビューしてください。** \`check-light.yml\` の通過（Nixビルド検証）も確認すること。
+
+          Closes #${{ github.event.issue.number }}" \
+            --base main \
+            --head "ai/packages-issue-${{ github.event.issue.number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
