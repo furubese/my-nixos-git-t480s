@@ -61,3 +61,11 @@
 - 「Nixコード変更はテストを通してからPRを出してほしい」という要望を受けて短いDeep Interviewを実施。調査の結果、`check-light.yml`が既に`pull_request`トリガーで自動テストを実行する設計になっており、要望の大部分は既に満たされていることが判明
 - GitHub Branch protection（必須ステータスチェック）による強制ブロックも検討したが、`check-light.yml`がpathsフィルタ付きのため、Nixコードを含まないPR（AGENTS.mdのみ等）に同じ必須チェックをかけると永久に判定待ちになりマージ不能になるという既知の落とし穴が判明。ユーザーの判断でブロック機構は導入しないことに決定
 - 曖昧度8%で早期収束（新規実装が不要と分かったため、omc-planコンセンサスは経由せず直接実行）。`feat-zsh-ohmyzsh`（PR #1）と`docs-agents-md`（PR #2）を実際にPR化し、動作を確認する運びとした
+
+## AI駆動Issue→PR自動化の実装（story.mdの構想を実現）
+
+- 以前のDeep Interviewで意図的に見送っていた`ai-issue-handler.yml`を、ユーザーからの明示的な依頼を受けて実装
+- 実装前に2点確認：①公開リポジトリでの起動条件（ラベルゲート方式を採用。ラベル付与にはtriage/write権限が必要なため、誰でも作成できるissueだけでは起動しない）、②ANTHROPIC_API_KEYの有無（未取得とのことで、Anthropic Consoleでの取得手順を案内）
+- story.mdの元案から一歩進めて、AIには`modules/packages.nix`の編集のみを許可（`Bash`ツールなし）し、ブランチ作成・差分検証（対象ファイル以外が変更されていたら中断）・コミット・PR作成はワークフロー側の確定的な処理で行う設計にした
+  - 理由：issue本文は信頼できない入力（プロンプトインジェクションの可能性）であり、AIの出力をそのままgit操作に使うのはリスクが高いため
+- この開発環境にはGitHub Actionsを実行する手段が無く、`claude --print`/`--allowedTools`の実際の挙動は未検証のまま実装した旨をREADMEに明記
