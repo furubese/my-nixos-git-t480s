@@ -9,6 +9,7 @@
     [ # Include the results of the hardware scan.
       ./hardware-configuration.nix
       ../../modules/packages.nix
+      ../../modules/shell.nix
     ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];

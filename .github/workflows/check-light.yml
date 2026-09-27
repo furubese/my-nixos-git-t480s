@@ -1,6 +1,6 @@
 on:
   pull_request:
-    paths: ['hosts/**', 'modules/packages.nix', 'flake.nix', 'flake.lock', 'home/**', 'tests/**']
+    paths: ['hosts/**', 'modules/**', 'flake.nix', 'flake.lock', 'home/**', 'tests/**']
 
 jobs:
   build:

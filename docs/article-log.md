@@ -42,3 +42,30 @@
 - 3並行ワーカーで実装：①`flake.nix`+`hosts/t480s/`、②`modules/`+`home/`+sops関連、③CI workflow+テスト+README
 - 実装後、計画のIn-session Verification Steps 1〜7（相対パス解決・flakeアトリビュート整合・識別子束縛・シークレット混入・リモート未作成・GitButler履歴確認など）をすべて実行し通過を確認。特に`hosts/t480s/configuration.nix`が元ファイルとの差分で「imports追加・hostname変更・experimental-features追加」の3点のみであること、`hardware-configuration.nix`がバイト同一であることを`git show <baseline>`との比較で確認した
 - オンマシンでの実際の`nix flake check`実行・`nixos-rebuild`実行は未実施（Non-Goal）。README記載の手順をユーザーが実機で試す段階
+
+## GitHub公開・運用フェーズ
+
+- ユーザーが自身でGitHubリポジトリ（`furubese/my-nixos-git-t480s`）を作成・push。ローカルの作業ディレクトリも`my-nixos-git-t480s`に改名
+- Cachixの`CACHIX_AUTH_TOKEN`をGitHub Actions Secretsに登録。チャットに一時的に貼られたトークンは無効化・再発行し、新しいものを登録する運用にした（秘密情報をチャットや履歴に残さない判断の徹底）
+- `check-light.yml`/`check-desktop.yml`のCachixキャッシュ名プレースホルダーを実名（`nixos-furubese-t480s-5gb`）に置換
+
+## 追加機能：zsh + oh-my-zsh のNix管理化
+
+- デフォルトシェルをzshにし、oh-my-zshを導入したいという要望を受け、システム側（ログインシェル切り替え・`/etc/shells`登録）とユーザー側（oh-my-zshのテーマ・プラグイン等）を分離して設計
+  - 理由：ログインシェルの変更はシステム全体に影響するためNixOSモジュール（`modules/shell.nix`）に、oh-my-zshの中身は個人設定なのでHome Manager（`home/fse.nix`）に、と責務を分けた
+- `modules/shell.nix`を新規追加し`hosts/t480s/configuration.nix`からimport。`home/fse.nix`に`programs.zsh.oh-my-zsh`設定を追加
+- CIの`paths`フィルタを`modules/packages.nix`単体から`modules/**`に広げた（新しいモジュールを追加するたびに個別列挙するのは壊れやすいため）
+
+## テスト→PRフローの確認（Deep Interview 2回目）
+
+- 「Nixコード変更はテストを通してからPRを出してほしい」という要望を受けて短いDeep Interviewを実施。調査の結果、`check-light.yml`が既に`pull_request`トリガーで自動テストを実行する設計になっており、要望の大部分は既に満たされていることが判明
+- GitHub Branch protection（必須ステータスチェック）による強制ブロックも検討したが、`check-light.yml`がpathsフィルタ付きのため、Nixコードを含まないPR（AGENTS.mdのみ等）に同じ必須チェックをかけると永久に判定待ちになりマージ不能になるという既知の落とし穴が判明。ユーザーの判断でブロック機構は導入しないことに決定
+- 曖昧度8%で早期収束（新規実装が不要と分かったため、omc-planコンセンサスは経由せず直接実行）。`feat-zsh-ohmyzsh`（PR #1）と`docs-agents-md`（PR #2）を実際にPR化し、動作を確認する運びとした
+
+## AI駆動Issue→PR自動化の実装（story.mdの構想を実現）
+
+- 以前のDeep Interviewで意図的に見送っていた`ai-issue-handler.yml`を、ユーザーからの明示的な依頼を受けて実装
+- 実装前に2点確認：①公開リポジトリでの起動条件（ラベルゲート方式を採用。ラベル付与にはtriage/write権限が必要なため、誰でも作成できるissueだけでは起動しない）、②ANTHROPIC_API_KEYの有無（未取得とのことで、Anthropic Consoleでの取得手順を案内）
+- story.mdの元案から一歩進めて、AIには`modules/packages.nix`の編集のみを許可（`Bash`ツールなし）し、ブランチ作成・差分検証（対象ファイル以外が変更されていたら中断）・コミット・PR作成はワークフロー側の確定的な処理で行う設計にした
+  - 理由：issue本文は信頼できない入力（プロンプトインジェクションの可能性）であり、AIの出力をそのままgit操作に使うのはリスクが高いため
+- この開発環境にはGitHub Actionsを実行する手段が無く、`claude --print`/`--allowedTools`の実際の挙動は未検証のまま実装した旨をREADMEに明記
