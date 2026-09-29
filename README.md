@@ -3,6 +3,9 @@
 ホスト `t480s`（ThinkPad T480s、AMD搭載、ユーザー `fse`）のためのgit管理NixOS構成リポジトリ。
 `flake-parts` + Home Manager + sops-nix を統合し、AIによる編集対象を明確に分離した構造で管理する。
 
+<img width="1586" height="947" alt="image" src="https://github.com/user-attachments/assets/c8122012-db3e-4cec-8e32-fc53713eaab8" />
+
+
 ## ディレクトリ構成
 
 ```
