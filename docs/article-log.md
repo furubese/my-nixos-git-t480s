@@ -86,3 +86,23 @@
 - 試行回数の管理に外部の状態ストアを使わず、PRブランチ上のコミット数（`git rev-list --count origin/main..HEAD`）で数える設計にした。ステートレスな`workflow_run`イベント間で「今何回目か」を追加インフラなしに把握できる
 - `workflow_run`トリガーは対象ワークフローの`name:`フィールドと完全一致させる必要があると気づき、`check-light.yml`に明示的な`name: check-light`を追加した（元は無名で、ファイル名から暗黙的に決まる名前に依存するのはリスクがあるため）
 - 曖昧度が閾値を下回った時点で、omc-planコンセンサスは経由せず直接実装（既存のai-issue-handler.ymlと同じ安全設計を再利用するだけなので、新規の合意形成コストは不要と判断）
+
+## 実運用での問題発覚（issue #4, #6, #8, #10, #12で実地テスト）
+
+- mise・pythonパッケージ・openssl（ssh用）・ディスプレイマネージャー・Niri/Noctaliaと、実際にissueを5件出して`ai-issue-handler.yml`を試した
+- GitHub Actionsのデフォルトセキュリティ設定「Allow GitHub Actions to create and approve pull requests」がオフだったため、最初の実行（issue #4）は`gh pr create`が`GraphQL: GitHub Actions is not permitted to create or approve pull requests`で失敗。設定を有効化して解決
+- ラベルの付け外しで2回ワークフローが発火し、2回目が「ブランチが既にある」形で失敗する競合も実地で確認（想定していなかった穴）
+- **設計上の限界が判明**：ディスプレイマネージャー（issue #10→PR #11）やNiri/Noctalia（issue #12→PR #13）を依頼したところ、AIは`lightdm`・`niri`・`noctalia`を単なるパッケージ名として`environment.systemPackages`に追加しただけで、`services.displayManager.lightdm.enable`のような実際のサービス有効化は一切行われなかった。ユーザーからは「PRの名前が全部同じで区別できない」「CIが通っても気に入らない時に指摘する手段がない」「user-scope（Home Manager）の考慮がない」「モジュール化されておらずpackages.nixに全部書かれる」という具体的な指摘があり、2回目のDeep Interviewを開始した
+
+## AI編集スコープの全面再設計と5ラウンドのコンセンサスレビュー
+
+- 2回目のDeep Interview（10ラウンド、曖昧度19.25%）で、AIにNixコードを自由に生成させる方向へ大きく舵を切ることを決定。「安全なJSON配列出力」という制約を撤廃する、セキュリティ上重要な決定だったため、omc-planコンセンサス（Architect/Criticレビュー）をDeliberate modeで実施
+- **v1→v2**：Architectが「`modules/`配下すべてを自動importする設計だと、既存の`modules/overlays.nix`（overlay関数）を誤ってNixOSモジュールとしてimportしてビルド全体を破壊する」という致命的バグを発見。opt-inサブディレクトリ（`modules/ai/`）方式に変更
+- **v2→v3**：Planner自身が「check-light.ymlは実際にPR上で自動実行されることをGitHub APIで確認した」と誤った自己検証を報告してしまった（`conclusion: success`だけ見て`run_attempt`と`triggering_actor`を見落とした）。Architectの再レビューで「GITHUB_TOKENが作ったPRの初回ワークフロー実行は人間の手動承認が必要」というGitHub仕様が原因と判明し、ユーザーに`workflow_dispatch`での明示起動を選ぶか手動承認を継続するか確認、自動化維持を選択
+- **v3→v4（Critic REJECT）**：Criticが実際の実行履歴を精査し、「`workflow_dispatch`で起動しても`workflow_run`トリガーでautofixが連鎖する」という設計の前提が、autofixマージ後の実行履歴（bot起動のcheck-light完了4件、autofix発火0件）から見て機能していないことを実証。check-light自身が失敗時に直接`gh workflow run`でautofixをdispatchする設計に変更し、不確実な連鎖への依存を排除
+- **v4→v5**：Architectがアーキテクチャ自体は妥当と認めつつ、権限不足・ログ取得の競合状態・入力値未検証によるセキュリティ後退・YAML構文エラー・新規ファイルを見逃す差分チェック・正規表現の抜け、の6件を発見。全て修正
+- **v5→v5.1**：最終レビューで、修正のうち4件（`_trusted`チェックアウト順序・`GH_REPO`未設定・concurrencyキーの文字列不一致・正規表現修正の適用漏れ）がなお未解決と判明。**この時点でコンセンサスループの上限5回に到達**したため、Plannerが単独で最終修正を行い、Architect/Criticの再レビューを経ないまま「未レビューの最終版」として正直に開示した上でユーザーに提示することにした
+- 5ラウンドを通じて一貫していたパターン：毎回「アーキテクチャは妥当」というお墨付きの直後に、実装の具体的な部分（権限、イベントの意味論、正規表現の境界条件）に新しいバグが見つかった。AIエージェント同士のレビューでも、実装の細部の検証には限界があることを示す実例になった
+- **v5.1→v5.2（正式ループ外の追加スポットチェック）**：ユーザーが「未レビューのv5.1をそのまま進めるのは不安なので、もう1ラウンドだけArchitectレビューを追加で回したい」と希望。正式な5ラウンドコンセンサスの外側で、Architect単独（Criticなし）にv5.1の4件の修正だけを対象に絞った再検証を依頼した。結果、4件のうち1件（`_trusted`チェックアウト順序の修正）が**新たな**ブロッキングバグを生んでいたことが判明：autofixジョブで`_trusted`を先にcheckoutした後、対象ブランチを`path`未指定でcheckoutすると、`actions/checkout`が「一致する`.git`のないディレクトリの中身を削除する」仕様により直前の`_trusted/`ごと消えてしまい、後続の検証ステップが毎回失敗する設計になっていた。加えて、同じv5.1修正のうち`.git/info/exclude`方式が`ai-issue-handler.yml`にしか適用されておらず、`ai-issue-autofix.yml`と`ai-issue-feedback.yml`には未反映だったことも判明
+- 対応として、autofixは`_trusted`を`$RUNNER_TEMP`へ退避してからブランチをcheckoutする方式に変更（ブランチに触れる前に入力検証を済ませる必要があるため、`.git/info/exclude`方式ではなく退避方式を採用）、feedbackはhandlerと同じ「ブランチ先・`_trusted`後・exclude登録」方式に統一。あわせて正規表現の軽微な抜け2件（`Extra`の大文字限定、クォート付きキー未対応）も修正した
+- **このラウンドが示したこと**：正式な5ラウンドコンセンサスの上限に達した後の「念のための追加チェック」でも、新しいバグが見つかった。レビューを重ねるほど収穫逓減にはなるが、ゼロにはならない——という、このプロジェクト全体を通じて繰り返し実証されたパターンが、ループの枠外でも再現した。実装着手前に少なくとも一度は実機（GitHub Actions上）での動作確認を必須にすべき、という結論を補強する材料になった
