@@ -118,3 +118,22 @@
 - 実装中に見つけた計画からの小さな乖離：計画では`vars.AI_PIPELINE_ENABLED`のキルスイッチを「check-lightのdispatch-autofixジョブ、handler/autofix/feedbackの起動条件すべてに適用」と明記していたが、最初の実装ではcheck-light側にしか反映しておらず、書きながら見直して3ワークフローすべてのジョブ条件に追加した。計画書の文言を実装時にもう一度読み直すことの重要性を実感した一幕
 - `AGENTS.md`・`README.md`を新設計に合わせて全面更新。`AGENTS.md`にはAIパイプラインの設計判断の理由（なぜ`workflow_run`連鎖をやめたか、なぜ`_trusted`を`$RUNNER_TEMP`へ退避するか等）を、後から読む人間・エージェントが再発明しなくて済むよう明記した
 - 実装後、`AGENTS.md`が自ら定めている「nixが無い環境での機械的チェック」（相対パス存在確認、flake.nix参照の整合性、bareな入力参照の禁止、シークレットパターンのgrep）を一通り実行し、いずれも問題なしを確認。ただし実際の`nix flake check`・`nixos-rebuild test`・GitHub Actions上での動作確認はまだ行っていない——次にやるべきことは、テスト用issueを1件出して実地で動かしてみること
+- 実装コミットをGitButlerでpush・PR作成（`ai-handler-plan-v52-review`が親、`ai-handler-redesign-implementation`が子のスタック構成のためPRも2本に分かれた：#14と#15）。ユーザーが両PRをマージし、`but pull`でローカルワークスペースも追従させた
+- `AI_PIPELINE_ENABLED`リポジトリ変数はGitHub Web UI（Settings → Secrets and variables → Actions → Variablesタブ）から設定してもらった。この開発環境には`gh`の認証手段が無いため、キルスイッチのような「一度だけ設定すればよいリポジトリ設定」はユーザー側の作業として明確に切り分けた
+
+## 実地テスト第1弾：issue #17（Niri/Noctalia、旧バグの回帰テスト）
+
+- ユーザーの選択で、以前まさに問題が発覚したのと同じテーマ（issue #10/#12→PR #11/#13で「パッケージ名だけ追加されサービス有効化されない」という不具合が出た、Niri/Noctaliaのディスプレイマネージャー整備）でissue #17を作成。新設計が本当にこの不具合を解決できているかを直接検証する、最も意味のある最初のテストケースとして選んだ
+- issue #17に`package-request`ラベル付与後、`ai-issue-handler.yml`が起動（run 36590240481）。GitHub Actions APIで進行状況を確認したところ、チェックアウト・作業ブランチ作成・`_trusted`除外登録・`_trusted`チェックアウト・nixインストールまでは全ステップ成功し、OpenRouter (GLM 5.3) への問い合わせステップで進行中——これは今回のレビューサイクルで何度も修正した部分（チェックアウト順序、`.git/info/exclude`）が実地でも問題なく動いていることを示す、最初の実証データ
+- **結果：成功**。PR #18として`home/ai/niri-config.kdl`（141行、許可した`.kdl`拡張子が実際に使われた）・`home/ai/niri.nix`・`modules/ai/niri-desktop.nix`の3ファイルが生成された。決定的だったのは`modules/ai/niri-desktop.nix`の中身——`programs.niri.enable = true;`, `services.greetd.enable = true;`（lightdmではなくWayland向けのgreetd+tuigreetをAIが自分で選択）など、**パッケージ名ではなく実際のサービス有効化コード**が生成されていた。これがまさにこの再設計全体の出発点だった不具合（issue #10/#12→PR #11/#13でパッケージ名だけ追加されサービスが有効化されなかった件）の直接的な解消の証拠になった
+- advisory content scanも正しく機能：`security.polkit.enable`を含んでいたため`needs-careful-review`ラベルが自動付与された（ブロックはせず、レビュー時の注意喚起のみという設計通り）
+- **想定外の発見（バグではないが無駄）**：`check-light.yml`がこのPRに対して2回走っていた。1つは`ai-issue-handler.yml`が明示的に`gh workflow run check-light.yml --ref`で起動した`workflow_dispatch`版（承認不要で即成功——設計通り）。もう1つは`check-light.yml`に残したままの`on.pull_request`トリガーがPR作成時に自動発火したもので、こちらは`GITHUB_TOKEN`作成PRの初回実行として`action_required`でブロックされ、ユーザーが手動で承認して動かしていた。パイプラインの正しさ自体には影響しない（`workflow_dispatch`版が実質的な検証を担っている）が、CIが二重に走り、かつ人間の承認クリックが（本来不要なはずなのに）結局1回発生するという非効率が実地で初めて判明した。5ラウンド＋αのペーパーレビューでは指摘されなかった点で、「実装して実際に動かしてみないと分からないことがある」というこのプロジェクト全体の教訓を裏付ける一例になった
+
+## モジュール移行後の棚卸し：`modules/packages.nix`に残っていた旧設計の残骸
+
+- ユーザーがPR #18をマージした後、「`modules/packages.nix`などが過去AIが変に変更したままなのは仕方ないのか」と指摘。調べたところ、旧設計（パッケージ名JSON配列のみ出力）時代に追加されたパッケージが、今回の再設計後も未整理のまま残っていることが判明した：
+  - `lightdm`, `lightdm-gtk-greeter`（issue #10）：PR #18のniri+greetd+tuigreet化で完全に代替されたが、パッケージとしてはインストールされ続けていた（サービス有効化されていないため実害はないが死んだ設定）
+  - `niri`（issue #12）：`modules/ai/niri-desktop.nix`の`programs.niri.enable`が既にパッケージを引き込むため冗長
+  - `openssh`（issue #6）：**旧設計の不具合がそのまま残っていた実例**。パッケージとしては入っているが`services.openssh.enable`は`hosts/t480s/configuration.nix`で今もコメントアウトされたまま——つまりsshdは有効化されていない。これはまさにこの再設計のきっかけになった「パッケージだけ追加されサービスが有効化されない」問題そのものが、`modules/packages.nix`という今はAI編集スコープ外になったファイルの中に、直り切らずに残っていたことを意味する
+- `modules/packages.nix`は今回の再設計で明確に「人間編集専用」と位置づけたファイルなので、これはAIパイプラインの継続的な監視対象ではなく、人間（またはユーザーの指示を受けたエージェント）が棚卸しすべき箇所と判断。ユーザーにopensshの意図（sshdを実際に有効化したいか、クライアントコマンドのみで十分か）を確認したところ「クライアントだけで十分」との回答だったため、sshdは意図的に無効のままとし、その旨をコメントで明記。`lightdm`/`lightdm-gtk-greeter`/`niri`は削除した
+- **教訓**：AIパイプラインの設計をいくら改善しても、それ以前に生成された変更が既にマージされてリポジトリに残っている場合、新しい安全設計は遡及的には効かない。移行時の棚卸しは自動化できず、人間が明示的に気づいて対応する必要がある一例だった
