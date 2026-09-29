@@ -1,0 +1,264 @@
+name: AI Issue Feedback
+
+# セキュリティ/設計メモ:
+# - `issue_comment` は issue とPRの両方で発火するため、対象がPRであること
+#   （github.event.issue.pull_request が存在すること）を確認する。
+# - コメント投稿者がリポジトリ所有者（github.repository_owner）であることを確認したうえで
+#   のみ起動する。公開リポジトリで部外者のコメントによる不要なAPI消費を防ぐため。
+# - `resolve` ジョブで、対象PRが実際に ai/issue-N ブランチ・同一リポジトリ・
+#   github-actions bot作成であることも確認してから `feedback` ジョブに進む
+#   （所有者のコメントであっても、無関係な通常PRへのコメントでは絶対に動かないようにする）。
+# - AIの書き込み対象・検証方法は ai-issue-handler.yml / ai-issue-autofix.yml と同一
+#   （modules/ai/**, home/ai/**, tests/ai/** への path allow-list、構文チェックのみ、
+#   advisory contentスキャン）。
+# - 修正コミットをpushした後、AIからの追加の返信コメントは行わない（Deep Interview
+#   Round 10で確認済みの方針）。唯一の例外は、advisory content scanが危険そうな構文を
+#   検出した場合——このときはラベルに加えてPRコメントで明示的に注意喚起する
+#   （コンセンサス中にユーザーの明示的な同意を得た例外）。
+# - PRコメント本文（コメント投稿者は所有者に限定済みとはいえ）はAIプロンプトに渡す前に
+#   sanitize_text() を通す（HTMLコメント除去等、他の入力経路と扱いを揃えるため）。
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  issues: write
+
+jobs:
+  resolve:
+    if: >
+      github.event.issue.pull_request != null &&
+      github.event.comment.user.login == github.repository_owner &&
+      vars.AI_PIPELINE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.pr.outputs.branch }}
+      proceed: ${{ steps.pr.outputs.proceed }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - id: pr
+        run: |
+          branch=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)
+          is_cross=$(gh pr view "$PR_NUMBER" --json isCrossRepository -q .isCrossRepository)
+          author=$(gh pr view "$PR_NUMBER" --json author -q .author.id)
+          proceed=false
+          if [[ "$branch" =~ ^ai/issue-[0-9]+$ ]] && [ "$is_cross" = "false" ] && [ "$author" = "github-actions" ]; then
+            proceed=true
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+  feedback:
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ai-branch-${{ needs.resolve.outputs.branch }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ needs.resolve.outputs.branch }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - name: 対象PRブランチをcheckout
+        uses: actions/checkout@v4
+        with: { ref: "${{ needs.resolve.outputs.branch }}", fetch-depth: 0 }
+
+      - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
+        run: echo '_trusted/' >> .git/info/exclude
+
+      - name: 信頼済みスクリプトをmainから取得（このブランチ自身では書き換えられない）
+        uses: actions/checkout@v4
+        with: { ref: main, path: _trusted, persist-credentials: false }
+
+      - uses: cachix/install-nix-action@v27
+
+      - name: OpenRouter (GLM 5.3) にフィードバック反映を依頼し、許可パスへ書き込む
+        run: |
+          python3 <<'PYEOF'
+          import glob
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import ai_pipeline  # noqa: E402
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          comment = ai_pipeline.sanitize_text(os.environ.get("COMMENT_BODY", ""), max_len=2000)
+          api_key = os.environ["OPENROUTER_API_KEY"]
+
+          ai_files = {}
+          for pattern in ("modules/ai/*", "home/ai/*", "tests/ai/*"):
+              for path in glob.glob(pattern):
+                  if os.path.isfile(path) and os.path.basename(path) != "default.nix":
+                      ai_files[path] = open(path, encoding="utf-8").read()
+          current_block = "\n\n".join(
+              f"--- {path} ---\n{content}" for path, content in ai_files.items()
+          ) or "(no AI-managed files currently exist)"
+
+          prompt = f"""あなたはNixOS設定リポジトリのPRに対する人間のフィードバックを反映する
+          アシスタントです。以下は、このPRであなたが以前に生成した
+          modules/ai/**, home/ai/**, tests/ai/** 配下のファイル（書き込める範囲はこの3
+          ディレクトリの直下のみ、ネスト禁止）と、リポジトリ所有者からのPRコメントです。
+
+          {current_block}
+
+          --- リポジトリ所有者からのPRコメント ---
+          {comment}
+
+          コメントの指摘を反映した「変更後の完全なファイル内容」を、変更が必要なファイルに
+          ついてのみ出力してください（変更不要なファイルは含めない）。新しいファイルを
+          追加しても構いませんが、パスは modules/ai/**, home/ai/**, tests/ai/** の直下のみです。
+
+          出力は以下のスキーマのJSONオブジェクト1つのみとしてください。説明文・
+          コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと：
+          {{
+            "files": {{ "<許可パス>": "<ファイルの完全な内容>", ... }},
+            "title": "<今回の修正を要約した短い説明（日本語可）>",
+            "summary": "<何をどう修正したかの要約>"
+          }}
+          """
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": "z-ai/glm-5.3",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0,
+              }).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(req, timeout=120) as resp:
+              response = json.load(resp)
+
+          raw = response["choices"][0]["message"]["content"].strip()
+          print(f"AI raw response: {raw}")
+
+          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+          if fence_match:
+              raw = fence_match.group(1).strip()
+
+          try:
+              result = json.loads(raw)
+          except json.JSONDecodeError:
+              print(f"::error::AIの応答がJSONとして解釈できません: {raw!r}")
+              sys.exit(1)
+
+          if not isinstance(result, dict) or "files" not in result:
+              print("::error::AIの応答に'files'キーがありません。中断します。")
+              sys.exit(1)
+
+          files = result["files"]
+          title = str(result.get("title") or "feedback")[:100]
+          summary = str(result.get("summary") or "(要約なし)")[:2000]
+
+          if not isinstance(files, dict) or not files:
+              print("::error::filesが空です。コメントから具体的な修正を読み取れなかった可能性があります。中断します。")
+              sys.exit(1)
+
+          violations = ai_pipeline.validate_paths(list(files.keys()))
+          if violations:
+              print(f"::error::許可リスト外のパスが含まれています: {violations}。中断します。")
+              sys.exit(1)
+
+          for path, content in files.items():
+              if not isinstance(content, str):
+                  print(f"::error::{path} の内容が文字列ではありません。中断します。")
+                  sys.exit(1)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"wrote {path} ({len(content)} bytes)")
+
+          with open(os.path.join(runner_temp, "expected_files.txt"), "w", encoding="utf-8") as f:
+              f.write("\n".join(sorted(files.keys())))
+          with open(os.path.join(runner_temp, "commit_msg.txt"), "w", encoding="utf-8") as f:
+              f.write(f"feedback: {title}\n\n{summary}\n\nAI-generated from PR review feedback.\n")
+          PYEOF
+
+      - name: 変更が許可リスト・AI申告パスと完全一致することを検証
+        run: |
+          git add -A
+          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged_files.txt"
+          sort "$RUNNER_TEMP/expected_files.txt" > "$RUNNER_TEMP/expected_files_sorted.txt"
+          if [ ! -s "$RUNNER_TEMP/staged_files.txt" ]; then
+            echo "::error::変更がありませんでした。中断します。"
+            exit 1
+          fi
+          if ! diff -q "$RUNNER_TEMP/staged_files.txt" "$RUNNER_TEMP/expected_files_sorted.txt" > /dev/null; then
+            echo "::error::実際に変更されたファイルがAI申告分と一致しません。"
+            echo "staged:"; cat "$RUNNER_TEMP/staged_files.txt"
+            echo "expected:"; cat "$RUNNER_TEMP/expected_files_sorted.txt"
+            exit 1
+          fi
+
+      - name: Nix構文チェック（括弧バランス等。ビルド検証自体はcheck-light.ymlに委ねる）
+        run: |
+          while IFS= read -r f; do
+            case "$f" in
+              *.nix)
+                echo "checking $f"
+                nix-instantiate --parse "$f" > /dev/null
+                ;;
+            esac
+          done < "$RUNNER_TEMP/staged_files.txt"
+
+      - name: 危険な構文のアドバイザリスキャン（ブロックはしない、ラベル・コメントのみ）
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import ai_pipeline  # noqa: E402
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          with open(os.path.join(runner_temp, "staged_files.txt"), encoding="utf-8") as f:
+              staged = [line.strip() for line in f if line.strip()]
+
+          all_hits = set()
+          for path in staged:
+              with open(path, encoding="utf-8") as f:
+                  all_hits.update(ai_pipeline.scan_dangerous_content(f.read()))
+
+          with open(os.path.join(runner_temp, "scan_hits.json"), "w", encoding="utf-8") as f:
+              json.dump(sorted(all_hits), f)
+          if all_hits:
+              print(f"::warning::advisory scan matched {len(all_hits)} pattern(s), PR will be labeled + commented for extra review")
+          PYEOF
+
+      - name: 修正コミットを同じPRブランチにpush
+        run: |
+          git config user.name "ai-issue-handler[bot]"
+          git config user.email "ai-issue-handler@users.noreply.github.com"
+          git commit -F "$RUNNER_TEMP/commit_msg.txt"
+          git push origin "HEAD:$BRANCH"
+
+      - name: アドバイザリスキャンでヒットがあれば、ラベルと注意喚起コメントを付ける（唯一の返信例外）
+        run: |
+          if [ "$(cat "$RUNNER_TEMP/scan_hits.json")" != "[]" ]; then
+            gh label create "needs-careful-review" --color FBCA04 \
+              --description "AI content scan flagged a potentially sensitive construct" --force
+            gh pr edit "$PR_NUMBER" --add-label "needs-careful-review"
+            gh pr comment "$PR_NUMBER" --body "フィードバック反映後のアドバイザリスキャンが、注意が必要な可能性のある構文を検出しました。マージ前に差分を特に注意深く確認してください。"
+          fi
+
+      - name: check-lightを再起動
+        run: gh workflow run check-light.yml --ref "$BRANCH"

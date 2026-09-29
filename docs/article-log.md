@@ -106,3 +106,15 @@
 - **v5.1→v5.2（正式ループ外の追加スポットチェック）**：ユーザーが「未レビューのv5.1をそのまま進めるのは不安なので、もう1ラウンドだけArchitectレビューを追加で回したい」と希望。正式な5ラウンドコンセンサスの外側で、Architect単独（Criticなし）にv5.1の4件の修正だけを対象に絞った再検証を依頼した。結果、4件のうち1件（`_trusted`チェックアウト順序の修正）が**新たな**ブロッキングバグを生んでいたことが判明：autofixジョブで`_trusted`を先にcheckoutした後、対象ブランチを`path`未指定でcheckoutすると、`actions/checkout`が「一致する`.git`のないディレクトリの中身を削除する」仕様により直前の`_trusted/`ごと消えてしまい、後続の検証ステップが毎回失敗する設計になっていた。加えて、同じv5.1修正のうち`.git/info/exclude`方式が`ai-issue-handler.yml`にしか適用されておらず、`ai-issue-autofix.yml`と`ai-issue-feedback.yml`には未反映だったことも判明
 - 対応として、autofixは`_trusted`を`$RUNNER_TEMP`へ退避してからブランチをcheckoutする方式に変更（ブランチに触れる前に入力検証を済ませる必要があるため、`.git/info/exclude`方式ではなく退避方式を採用）、feedbackはhandlerと同じ「ブランチ先・`_trusted`後・exclude登録」方式に統一。あわせて正規表現の軽微な抜け2件（`Extra`の大文字限定、クォート付きキー未対応）も修正した
 - **このラウンドが示したこと**：正式な5ラウンドコンセンサスの上限に達した後の「念のための追加チェック」でも、新しいバグが見つかった。レビューを重ねるほど収穫逓減にはなるが、ゼロにはならない——という、このプロジェクト全体を通じて繰り返し実証されたパターンが、ループの枠外でも再現した。実装着手前に少なくとも一度は実機（GitHub Actions上）での動作確認を必須にすべき、という結論を補強する材料になった
+
+## v5.2計画の実装（`.github/scripts/ai_pipeline.py`、3ワークフロー、`modules/ai`・`home/ai`）
+
+- 「ペーパーレビューは収穫逓減に入った。これ以上重ねるより実装して実機で試す方が効率的」という判断で実装フェーズへ進むことをユーザーに推奨し、承認を得た
+- 共有検証スクリプト`.github/scripts/ai_pipeline.py`を新規作成。パス許可リスト検証・ブランチ名検証・issue本文/PRコメントのサニタイズ（HTMLコメント除去、未クローズのコメントも含む）・アドバイザリ内容スキャン・`validate-dispatch`（`gh`経由でのブランチ/PR/run_id相互検証）をCLIサブコマンド兼importable moduleとして実装し、pythonの単体アサーションで動作確認（この開発環境にはnixもGitHub Actionsの実行手段も無いため、これが実質的な唯一の実行時検証）
+- `modules/ai/default.nix`, `home/ai/default.nix`を新規作成：直下の`*.nix`ファイルのみを自動importする「オプトイン方式」。v1→v2のレビューで見つかった「`modules/**`全体を自動importすると`modules/overlays.nix`（NixOSモジュールではなくoverlay関数）を巻き込んで壊れる」というバグを最初から回避する設計として、計画通りに実装した
+- `tests/ai/default.nix`も同様の許可パスとして作成したが、`flake.nix`（AI編集スコープ外）への配線はまだ行っていない——既存の`tests/desktop-full.nix`と同じく「予約済みだが未配線のプレースホルダー」という扱いにした
+- `hosts/t480s/configuration.nix`・`home/fse.nix`にそれぞれ`modules/ai`・`home/ai`のimportを追加（これは人間が行うセットアップ作業であり、AI編集スコープの制約対象ではない）
+- `check-light.yml`・`ai-issue-handler.yml`・`ai-issue-autofix.yml`を計画通りに全面書き換え、新規`ai-issue-feedback.yml`を作成。3つのAIワークフローとも、AIの出力を「ファイルパス→内容のJSONマップ」として受け取り、許可リスト検証→`nix-instantiate --parse`による構文チェックのみ（ビルド検証はcheck-light.ymlに委ねる）→advisory内容スキャン（ブロックせずラベル付けのみ）という同じ検証パイプラインを通す設計にした
+- 実装中に見つけた計画からの小さな乖離：計画では`vars.AI_PIPELINE_ENABLED`のキルスイッチを「check-lightのdispatch-autofixジョブ、handler/autofix/feedbackの起動条件すべてに適用」と明記していたが、最初の実装ではcheck-light側にしか反映しておらず、書きながら見直して3ワークフローすべてのジョブ条件に追加した。計画書の文言を実装時にもう一度読み直すことの重要性を実感した一幕
+- `AGENTS.md`・`README.md`を新設計に合わせて全面更新。`AGENTS.md`にはAIパイプラインの設計判断の理由（なぜ`workflow_run`連鎖をやめたか、なぜ`_trusted`を`$RUNNER_TEMP`へ退避するか等）を、後から読む人間・エージェントが再発明しなくて済むよう明記した
+- 実装後、`AGENTS.md`が自ら定めている「nixが無い環境での機械的チェック」（相対パス存在確認、flake.nix参照の整合性、bareな入力参照の禁止、シークレットパターンのgrep）を一通り実行し、いずれも問題なしを確認。ただし実際の`nix flake check`・`nixos-rebuild test`・GitHub Actions上での動作確認はまだ行っていない——次にやるべきことは、テスト用issueを1件出して実地で動かしてみること

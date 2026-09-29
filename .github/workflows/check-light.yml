@@ -1,20 +1,55 @@
 name: check-light
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths: ['hosts/**', 'modules/**', 'flake.nix', 'flake.lock', 'home/**', 'tests/**']
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@v27
-      - uses: cachix/cachix-action@v15
+      - name: Cachixへプッシュ（AIブランチではトークンを渡さずスキップ）
+        if: "!startsWith(github.head_ref || github.ref_name, 'ai/issue-')"
+        uses: cachix/cachix-action@v15
         with:
           name: nixos-furubese-t480s-5gb
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+      - name: Cachix（AIブランチ、読み取りのみ・pushなし）
+        if: "startsWith(github.head_ref || github.ref_name, 'ai/issue-')"
+        uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          # authTokenを渡さない = 読み取りのみ、pushしない。AI生成コードをビルドした
+          # 成果物をキャッシュに書き込ませないための意図的な制限。
       - name: ビルド検証
         run: nix build .#nixosConfigurations.t480s.config.system.build.toplevel
       - name: 軽量テスト（起動・パッケージ存在確認）
         run: nix build .#checks.x86_64-linux.smoke -L
+
+  dispatch-autofix:
+    needs: build
+    if: >
+      failure() &&
+      startsWith(github.head_ref || github.ref_name, 'ai/issue-') &&
+      vars.AI_PIPELINE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - name: autofixを直接dispatch
+        run: |
+          gh workflow run ai-issue-autofix.yml --ref main \
+            -f branch="$BRANCH" \
+            -f run_id="${{ github.run_id }}"

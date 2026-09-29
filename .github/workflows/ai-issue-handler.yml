@@ -1,17 +1,23 @@
 name: AI Issue Handler
 
-# セキュリティ設計:
+# セキュリティ設計（v2: 自由なNixコード生成に対応した版。旧版はパッケージ名JSON配列のみ出力させていた）:
 # - トリガーは `labeled` イベントのみ。GitHubのデフォルト権限では、issueへのラベル付与には
 #   triage/write権限が必要なため、公開リポジトリで誰でも作成できる issue 本文だけでは
 #   このワークフローは起動しない（`package-request` ラベルを付けられる=信頼できる人だけが起動できる）。
 # - issue本文・タイトルは信頼できない入力として扱う。シェルの `run:` ブロックに直接
-#   `${{ github.event.issue.body }}` を埋め込まない（コマンドインジェクションの原因になるため）。
-#   必ず `env:` 経由で渡し、スクリプト側で変数として読む。
-# - AI（OpenRouter経由のGLM 5.3）にはNixコードそのものを生成させない。
-#   「追加後の完全なパッケージ名リスト（JSON配列の文字列）」だけを出力させ、各要素を
-#   安全な識別子パターンで検証したうえで、ワークフロー側が固定テンプレートに埋め込んで
-#   modules/packages.nix を再構築する。AIの出力を直接コードとして書き込むことは一切ない。
-# - ブランチ作成・コミット・push・PR作成はすべて確定的な処理（AIには渡さない）。
+#   `${{ github.event.issue.body }}` を埋め込まない。必ず `env:` 経由で渡し、Python側で
+#   ai_pipeline.sanitize_text() を通してから使う。
+# - AI（OpenRouter経由のGLM 5.3）は自由なNixコードを生成してよい。ただし：
+#     1. 出力できるファイルパスは modules/ai/**, home/ai/**, tests/ai/**（直下のみ、ネスト禁止）
+#        に限定し、.github/scripts/ai_pipeline.py の allow-list で機械的に検証する。
+#     2. これはサンドボックスではない（許可パス内でも任意のNixOSオプションを設定できる）。
+#        実質的な防御線は、マージ前に人間がPRの全差分を読むこと。
+#     3. 生成後は構文チェックのみ（nix-instantiate --parse）を行う。実際のビルド検証は
+#        既存の check-light.yml に委ね、ここでは重複したビルドを行わない。
+#     4. 危険そうな構文（ai_pipeline.py の advisory scan）を検出した場合はPRにラベルを
+#        付けるだけで、生成自体をブロックはしない（ブロックできるほど正規表現は信頼できない）。
+# - 検証ロジック（.github/scripts/ai_pipeline.py）は必ず main からのみ取得する（path: _trusted）。
+#   このブランチ自身がその検証ロジックを書き換えて自己正当化することはできない。
 on:
   issues:
     types: [labeled]
@@ -19,22 +25,40 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: ai-branch-ai/issue-${{ github.event.issue.number }}
 
 jobs:
   ai-edit:
-    if: github.event.label.name == 'package-request'
+    if: github.event.label.name == 'package-request' && vars.AI_PIPELINE_ENABLED == 'true'
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ai/issue-${{ github.event.issue.number }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 作業ブランチを作成
-        run: git checkout -b "ai/packages-issue-${{ github.event.issue.number }}"
+      - name: 作業ブランチをmainから作成（既存でも強制的にリセット）
+        run: git checkout -B "$BRANCH"
 
-      - name: OpenRouter (GLM 5.3) にパッケージリストの生成を依頼し、検証して反映
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
+      - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
+        run: echo '_trusted/' >> .git/info/exclude
+
+      - name: 信頼済みスクリプトをmainから取得（このブランチ自身では書き換えられない）
+        uses: actions/checkout@v4
+        with: { ref: main, path: _trusted, persist-credentials: false }
+
+      - uses: cachix/install-nix-action@v27
+
+      - name: OpenRouter (GLM 5.3) にNixコード生成を依頼し、許可パスへ書き込む
         run: |
           python3 <<'PYEOF'
           import json
@@ -43,28 +67,68 @@ jobs:
           import sys
           import urllib.request
 
-          current = open("modules/packages.nix", encoding="utf-8").read()
-          issue_title = os.environ.get("ISSUE_TITLE", "")
-          issue_body = os.environ.get("ISSUE_BODY", "")
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import ai_pipeline  # noqa: E402
+
+          def read_if_exists(path):
+              try:
+                  return open(path, encoding="utf-8").read()
+              except FileNotFoundError:
+                  return "(does not exist)"
+
+          # 読み取り専用コンテキスト：AIはこれらを読んで既存の構造・命名規則
+          # （ユーザー名 fse、ホスト名 t480s 等）を把握するが、これらのファイル自体は
+          # 出力対象に含められない（許可リストに入っていないため）。
+          context = {
+              "hosts/t480s/configuration.nix": read_if_exists("hosts/t480s/configuration.nix"),
+              "modules/packages.nix": read_if_exists("modules/packages.nix"),
+              "modules/shell.nix": read_if_exists("modules/shell.nix"),
+              "modules/desktop.nix": read_if_exists("modules/desktop.nix"),
+              "home/fse.nix": read_if_exists("home/fse.nix"),
+          }
+          context_block = "\n\n".join(
+              f"--- {path}（読み取り専用、編集不可） ---\n{content}"
+              for path, content in context.items()
+          )
+
+          issue_title = ai_pipeline.sanitize_text(os.environ.get("ISSUE_TITLE", ""), max_len=300)
+          issue_body = ai_pipeline.sanitize_text(os.environ.get("ISSUE_BODY", ""), max_len=4000)
+          issue_number = os.environ["ISSUE_NUMBER"]
           api_key = os.environ["OPENROUTER_API_KEY"]
 
-          prompt = f"""あなたはNixOS設定リポジトリの modules/packages.nix を更新するアシスタントです。
-          Nixコードは絶対に出力しないでください。出力は「追加後の完全なパッケージ名リスト」を表す
-          JSON配列の文字列のみとしてください（例: ["git", "htop", "ripgrep"]）。
-          説明文・コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと。
+          prompt = f"""あなたはNixOS設定リポジトリに変更を加えるアシスタントです。
+          このリポジトリでは、あなたが書き込めるファイルパスは以下の3つのディレクトリの
+          直下（サブディレクトリ禁止）に限定されています：
+            modules/ai/<name>.<nix|kdl|toml|json|conf>
+            home/ai/<name>.<nix|kdl|toml|json|conf>
+            tests/ai/<name>.<nix|kdl|toml|json|conf>
+          <name>は英数字・アンダースコア・ハイフンのみ。ファイル名は "default.nix" 禁止。
+          これ以外のパス（hosts/**, flake.nix, .github/**, secrets/** を含む）には
+          一切書き込めません。
 
-          --- issueタイトル ---
+          modules/ai/*.nix は NixOSモジュールとして自動importされます
+          （`{{ pkgs, ... }}: {{ ... }}` の形の関数を返してください）。
+          home/ai/*.nix は Home Manager モジュールとして自動importされます。
+          .kdl/.toml/.json/.conf ファイルは、同じディレクトリに置いた .nix ファイルから
+          `home.file` 等で参照する設定ファイル本体として使えます。
+
+          {context_block}
+
+          --- issue #{issue_number} タイトル ---
           {issue_title}
 
-          --- issue本文 ---
+          --- issue #{issue_number} 本文 ---
           {issue_body}
 
-          --- 現在の modules/packages.nix ---
-          {current}
-
-          issueの内容から読み取れる追加パッケージを、既存のパッケージ名リストに追加した
-          「完全なパッケージ名リスト」をJSON配列として出力してください。
-          パッケージ名が一つも読み取れない場合は、既存のリストをそのまま出力してください。
+          出力は以下のスキーマのJSONオブジェクト1つのみとしてください。説明文・
+          コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと：
+          {{
+            "files": {{ "<許可パス>": "<ファイルの完全な内容>", ... }},
+            "title": "<変更内容を要約したPRタイトル（日本語可、60文字程度）>",
+            "summary": "<何をどう変えたかの要約。箇条書き推奨>"
+          }}
+          issueの内容から具体的な変更が読み取れない場合は、"files" を空オブジェクトに
+          してください（その場合このワークフローは変更なしとして中断します）。
           """
 
           req = urllib.request.Request(
@@ -81,80 +145,153 @@ jobs:
               method="POST",
           )
 
-          with urllib.request.urlopen(req, timeout=60) as resp:
+          with urllib.request.urlopen(req, timeout=120) as resp:
               response = json.load(resp)
 
           raw = response["choices"][0]["message"]["content"].strip()
           print(f"AI raw response: {raw}")
 
-          # コードフェンスで囲まれて返ってきた場合に備えて剥がす（無害化のための前処理であり、
-          # これによって内容の安全性チェックを省略してよいわけではない）
           fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
           if fence_match:
               raw = fence_match.group(1).strip()
 
           try:
-              packages = json.loads(raw)
+              result = json.loads(raw)
           except json.JSONDecodeError:
-              print(f"::error::AIの応答がJSON配列として解釈できません: {raw!r}")
+              print(f"::error::AIの応答がJSONとして解釈できません: {raw!r}")
               sys.exit(1)
 
-          if not isinstance(packages, list) or not packages:
-              print("::error::AIの応答が空、またはリスト形式ではありません。中断します。")
+          if not isinstance(result, dict) or "files" not in result:
+              print("::error::AIの応答に'files'キーがありません。中断します。")
               sys.exit(1)
 
-          # nixpkgs属性名として妥当な形（ドット区切りの識別子）のみ許可。
-          # これ以外の文字（; " ' $ ( ) 改行 等）を含む要素は一件でもあれば全体を拒否する。
-          safe = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*)*$")
-          for p in packages:
-              if not isinstance(p, str) or not safe.match(p):
-                  print(f"::error::安全でないパッケージ名が含まれています: {p!r}。中断します。")
+          files = result["files"]
+          title = str(result.get("title") or f"ai: address #{issue_number}")[:100]
+          summary = str(result.get("summary") or "(要約なし)")[:2000]
+
+          if not isinstance(files, dict) or not files:
+              print("::error::filesが空です。issueから具体的な変更を読み取れなかった可能性があります。中断します。")
+              sys.exit(1)
+
+          violations = ai_pipeline.validate_paths(list(files.keys()))
+          if violations:
+              print(f"::error::許可リスト外のパスが含まれています: {violations}。中断します。")
+              sys.exit(1)
+
+          for path, content in files.items():
+              if not isinstance(content, str):
+                  print(f"::error::{path} の内容が文字列ではありません。中断します。")
                   sys.exit(1)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"wrote {path} ({len(content)} bytes)")
 
-          packages = sorted(set(packages))
-          pkg_list = " ".join(packages)
-
-          new_content = (
-              "# AI-EDITABLE: パッケージ追加はこのリスト内のみで行うこと\n"
-              "{ pkgs, ... }:\n"
-              "{\n"
-              f"  environment.systemPackages = with pkgs; [ {pkg_list} ];\n"
-              "}\n"
-          )
-          open("modules/packages.nix", "w", encoding="utf-8").write(new_content)
-          print(f"modules/packages.nix updated with: {pkg_list}")
+          runner_temp = os.environ["RUNNER_TEMP"]
+          with open(os.path.join(runner_temp, "expected_files.txt"), "w", encoding="utf-8") as f:
+              f.write("\n".join(sorted(files.keys())))
+          with open(os.path.join(runner_temp, "pr_title.txt"), "w", encoding="utf-8") as f:
+              f.write(title)
+          with open(os.path.join(runner_temp, "pr_summary.txt"), "w", encoding="utf-8") as f:
+              f.write(summary)
+          with open(os.path.join(runner_temp, "commit_msg.txt"), "w", encoding="utf-8") as f:
+              f.write(f"{title}\n\n{summary}\n\nAI-generated (OpenRouter GLM 5.3), needs review.\nRefs #{issue_number}\n")
           PYEOF
 
-      - name: 変更が modules/packages.nix のみであることを検証
+      - name: 変更が許可リスト・AI申告パスと完全一致することを検証
         run: |
-          changed=$(git diff --name-only)
-          echo "変更されたファイル: $changed"
-          if [ -z "$changed" ]; then
-            echo "::error::変更がありませんでした。issue内容からパッケージ名を認識できなかった可能性があります。"
+          git add -A
+          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged_files.txt"
+          sort "$RUNNER_TEMP/expected_files.txt" > "$RUNNER_TEMP/expected_files_sorted.txt"
+          if [ ! -s "$RUNNER_TEMP/staged_files.txt" ]; then
+            echo "::error::変更がありませんでした。中断します。"
             exit 1
           fi
-          if [ "$changed" != "modules/packages.nix" ]; then
-            echo "::error::modules/packages.nix 以外のファイルが変更されたため中断します: $changed"
+          if ! diff -q "$RUNNER_TEMP/staged_files.txt" "$RUNNER_TEMP/expected_files_sorted.txt" > /dev/null; then
+            echo "::error::実際に変更されたファイルがAI申告分と一致しません。"
+            echo "staged:"; cat "$RUNNER_TEMP/staged_files.txt"
+            echo "expected:"; cat "$RUNNER_TEMP/expected_files_sorted.txt"
             exit 1
           fi
 
-      - name: コミット・push・PR作成
+      - name: Nix構文チェック（括弧バランス等。ビルド検証自体はcheck-light.ymlに委ねる）
+        run: |
+          while IFS= read -r f; do
+            case "$f" in
+              *.nix)
+                echo "checking $f"
+                nix-instantiate --parse "$f" > /dev/null
+                ;;
+            esac
+          done < "$RUNNER_TEMP/staged_files.txt"
+
+      - name: 危険な構文のアドバイザリスキャン（ブロックはしない、ラベル付けのみ）
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import ai_pipeline  # noqa: E402
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          with open(os.path.join(runner_temp, "staged_files.txt"), encoding="utf-8") as f:
+              staged = [line.strip() for line in f if line.strip()]
+
+          all_hits = set()
+          for path in staged:
+              with open(path, encoding="utf-8") as f:
+                  all_hits.update(ai_pipeline.scan_dangerous_content(f.read()))
+
+          with open(os.path.join(runner_temp, "scan_hits.json"), "w", encoding="utf-8") as f:
+              json.dump(sorted(all_hits), f)
+          if all_hits:
+              print(f"::warning::advisory scan matched {len(all_hits)} pattern(s), PR will be labeled for extra review")
+          PYEOF
+
+      - name: コミット・push
         run: |
           git config user.name "ai-issue-handler[bot]"
           git config user.email "ai-issue-handler@users.noreply.github.com"
-          git add modules/packages.nix
-          git commit -m "packages: address #${{ github.event.issue.number }} (AI-generated, needs review)"
-          git push origin "ai/packages-issue-${{ github.event.issue.number }}"
-          gh pr create \
-            --title "packages: address #${{ github.event.issue.number }}" \
-            --body "issue #${{ github.event.issue.number }} からAI（OpenRouter経由のGLM 5.3）が自動生成した変更です。
+          git commit -F "$RUNNER_TEMP/commit_msg.txt"
+          git push --force origin "HEAD:$BRANCH"
 
-          AIが生成したのはパッケージ名リスト（JSON配列）のみで、Nixコード自体はワークフローが
-          固定テンプレートで組み立てています。それでも **マージ前に必ず人間がレビューしてください。**
-          \`check-light.yml\` の通過（Nixビルド検証）も確認すること。
+      - name: PRを作成（既存なら本文・タイトルを更新）
+        run: |
+          body_file="$RUNNER_TEMP/pr_body.txt"
+          {
+            cat "$RUNNER_TEMP/pr_summary.txt"
+            echo
+            echo "---"
+            echo "issue #${ISSUE_NUMBER} からAI（OpenRouter経由のGLM 5.3）が自動生成した変更です。"
+            echo "AIはNixコードを直接生成しています。書き込み先パスは modules/ai/**, home/ai/**,"
+            echo "tests/ai/** の直下に機械的に制限されていますが、これは能力のサンドボックスでは"
+            echo "ありません。**マージ前に必ず全差分を人間がレビューしてください。**"
+            echo "\`check-light.yml\` の通過（Nixビルド検証）も確認すること。"
+            echo
+            echo "Closes #${ISSUE_NUMBER}"
+          } > "$body_file"
 
-          Closes #${{ github.event.issue.number }}" \
-            --base main \
-            --head "ai/packages-issue-${{ github.event.issue.number }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          existing_pr=$(gh pr list --head "$BRANCH" --json number -q '.[0].number')
+          if [ -n "$existing_pr" ]; then
+            gh pr edit "$existing_pr" --title "$(cat "$RUNNER_TEMP/pr_title.txt")" --body-file "$body_file"
+          else
+            gh pr create \
+              --title "$(cat "$RUNNER_TEMP/pr_title.txt")" \
+              --body-file "$body_file" \
+              --base main \
+              --head "$BRANCH"
+          fi
+
+      - name: アドバイザリスキャンでヒットがあればPRにラベル付け
+        run: |
+          if [ "$(cat "$RUNNER_TEMP/scan_hits.json")" != "[]" ]; then
+            gh label create "needs-careful-review" --color FBCA04 \
+              --description "AI content scan flagged a potentially sensitive construct" --force
+            pr_number=$(gh pr list --head "$BRANCH" --json number -q '.[0].number')
+            gh pr edit "$pr_number" --add-label "needs-careful-review"
+          fi
+
+      - name: check-lightを起動
+        run: gh workflow run check-light.yml --ref "$BRANCH"
