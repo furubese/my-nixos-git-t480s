@@ -10,6 +10,7 @@
       ./hardware-configuration.nix
       ../../modules/packages.nix
       ../../modules/shell.nix
+      ../../modules/ai
     ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];

@@ -12,20 +12,34 @@ hosts/t480s/
   configuration.nix          # ホスト本体設定（旧ルート直下のconfiguration.nixを移設）
   hardware-configuration.nix # ハードウェア固有設定（旧ルート直下のものをそのまま移設）
 modules/
-  packages.nix               # AI編集可能。environment.systemPackages はここだけで管理
+  packages.nix               # 人間が編集。environment.systemPackages はここだけで管理
   desktop.nix                 # スタブのみ（未実装・未import）。KDE/niri設定は次回以降
   overlays.nix                 # スタブのみ（未実装・未import）
+  ai/
+    default.nix                # AI編集不可。直下の*.nixファイルを自動importするだけの器
+    (AIが生成する *.nix/*.kdl/*.toml/*.json/*.conf がここに置かれる)
 home/
   fse.nix                    # Home Manager によるユーザー環境設定
+  ai/
+    default.nix                # AI編集不可。modules/ai/default.nixと同じ役割（Home Manager側）
+    (AIが生成するファイルがここに置かれる)
 secrets/
   secrets.yaml.example        # 平文の秘密情報テンプレート（暗号化前の雛形）
 .sops.yaml                    # sops-nix の鍵・暗号化ルール定義（recipientはプレースホルダー）
 tests/
   smoke.nix                   # checks.smoke として配線済み。modules/packages.nix のみをimport
   desktop-full.nix            # プレースホルダーのみ。checksに未登録
-.github/workflows/
-  check-light.yml              # 通常PR用の軽量ビルド・テストCI
-  check-desktop.yml            # 手動トリガー専用（workflow_dispatchのみ）。desktop.nix未実装のため
+  ai/
+    default.nix                # AI編集可能パスとして予約済みだが、flake.nixに未配線（プレースホルダー）
+.github/
+  scripts/
+    ai_pipeline.py              # AIパイプライン3ワークフロー共通の検証ロジック（必ずmainから取得）
+  workflows/
+    check-light.yml              # 通常PR用の軽量ビルド・テストCI（AIブランチはworkflow_dispatchで起動）
+    check-desktop.yml            # 手動トリガー専用（workflow_dispatchのみ）。desktop.nix未実装のため
+    ai-issue-handler.yml         # issueラベルからAIがNixコードを生成しPRを作成
+    ai-issue-autofix.yml         # check-light失敗時にAIへ自動修正させる
+    ai-issue-feedback.yml        # PRコメント（所有者のみ）でAIに追加修正させる
 docs/
   article-log.md               # 実装過程の意思決定ログ
 ```
@@ -121,51 +135,65 @@ GitHubリモートを作成しこのリポジトリを公開する前に、以�
 - [ ] `secrets/` 配下に平文の実秘密が含まれていない（`secrets.yaml.example` はテンプレートなので問題ない）
 - [ ] `git remote -v` にGitHub等の外部リモートが存在しない（GitButlerが自動追加する `gb-local` は問題ない、想定通り）
 
-## AI駆動のIssue→PR自動化（`ai-issue-handler.yml`）
+## AI駆動のIssue→PR自動化（3ワークフロー構成）
 
-`package-request`ラベルが付いたissueをトリガーに、AI（OpenRouter経由の`z-ai/glm-5.3`）が
-`modules/packages.nix`を編集し、自動でPRを作成する仕組みです。
+issue・CI失敗・PRコメントを起点に、AI（OpenRouter経由の`z-ai/glm-5.3`）が実際のNixコードを
+生成してPRを作成・更新する仕組みです。`ai-issue-handler.yml`（issue起点）、
+`ai-issue-autofix.yml`（CI失敗起点）、`ai-issue-feedback.yml`（PRコメント起点）の3つが、
+`.github/scripts/ai_pipeline.py`という共通の検証ロジックを共有します。
 
-- **セットアップ**：https://openrouter.ai/ でアカウントを作成し、`API Keys`からキーを発行してください。
-  クレジットのチャージが必要です。GitHub Secretsに`OPENROUTER_API_KEY`として登録してください
-  （`gh secret set OPENROUTER_API_KEY`でも可）。**チャットやコミットに絶対に貼らないこと。**
-- **トリガー条件**：issueに`package-request`ラベルが付与された時のみ実行されます。GitHubのデフォルト権限では
-  ラベル付与にtriage/write権限が必要なため、公開リポジトリで誰でも作成できるissue本文だけでは起動しません。
-- **安全策（2段構え）**：
-  1. AIにはNixコードを一切生成させない。「追加後の完全なパッケージ名リスト」をJSON配列としてのみ出力させ、
-     各要素を安全な識別子パターン（`git`, `python3Packages.numpy`のような形）で検証したうえで、
-     ワークフロー側が固定テンプレートに埋め込んでファイルを再構築する。検証に失敗する要素が一つでもあれば
-     ジョブ全体を中断する（AIの出力を直接コードとして書き込むことはない）
-  2. その上で、変更されたファイルが`modules/packages.nix`だけであることも機械的に再確認する
-  3. issue本文・タイトルは信頼できない入力として扱い、シェルスクリプトへの直接埋め込みではなく
-     環境変数経由でPythonスクリプトに渡している（コマンドインジェクション対策）
-- **未検証の前提**：この開発環境にはGitHub Actionsを実行する手段が無く、実際にOpenRouter APIを呼び出して
-  動作確認はできていません（バリデーションロジック自体は単体でテスト済み）。初回はテスト用issueで試し、
-  想定通り動くか確認することを推奨します。
+- **セットアップ**：
+  1. https://openrouter.ai/ でアカウントを作成し、`API Keys`からキーを発行。GitHub Secretsに
+     `OPENROUTER_API_KEY`として登録（`gh secret set OPENROUTER_API_KEY`）。
+     **チャットやコミットに絶対に貼らないこと。**
+  2. `gh variable set AI_PIPELINE_ENABLED --body true` を実行してキルスイッチを有効化
+     （未設定のままだとfail closedで全ワークフローが起動しません）。
+- **AIの編集対象**：`modules/ai/**`, `home/ai/**`, `tests/ai/**`の直下のみ（サブディレクトリ禁止、
+  `default.nix`禁止）。以前の設計（パッケージ名JSON配列のみ出力）から変更し、AIは実際のNixコード
+  （`services.displayManager.lightdm.enable = true;`のようなサービス有効化を含む）を自由に生成
+  できます。出力は`{"files": {"<パス>": "<内容>", ...}, "title": "...", "summary": "..."}`という
+  JSONで、`files`のキーがすべて許可パスに収まっているかを`ai_pipeline.py`が機械的に検証します。
+- **これはサンドボックスではない**：パスの許可リストは「どこに書き込めるか」だけを制限しており、
+  「どのNixOSオプションを設定できるか」は制限していません（意図的：ユーザースコープ設定やサービス
+  有効化まで扱えるようにするための設計変更です）。実質的な防御線は以下の多段の機械チェックと、
+  **マージ前に人間が全差分を読むこと**です：
+  1. 書き込まれたファイルパスが許可リスト（`modules/ai|home/ai|tests/ai` 直下、`default.nix`禁止）
+     と完全一致することを`git add -A` + `git diff --cached --name-only`で確認（新規ファイルも捕捉）
+  2. `nix-instantiate --parse`による構文チェックのみ実施（実際のビルド検証は`check-light.yml`に
+     委ね、二重には行わない）
+  3. 危険そうな構文（`hashedPassword`, `systemd.services`, `lib.mkForce`等）のアドバイザリスキャン
+     ——ただしこれは**PRをブロックしません**。正規表現はattrsetのネストで容易に回避できるため、
+     ブロックの根拠にはできないからです。ヒットした場合は`needs-careful-review`ラベルを付けて
+     人間の注意を引くだけです
+  4. issue本文・PRコメントは信頼できない入力として扱い、HTMLコメント除去等のサニタイズを経てから
+     環境変数経由でPythonスクリプトに渡します（コマンドインジェクション・プロンプトインジェクション対策）
+- **`.github/scripts/ai_pipeline.py`は必ず`main`から取得**：3ワークフローとも、このスクリプトを
+  `path: _trusted`で`main`ブランチから都度checkoutします。AI制御下のブランチが自分自身を検証する
+  ロジックを書き換えて検証をすり抜けることはできません。
+- **`ai-issue-handler.yml`**：`package-request`ラベル付与（triage/write権限が必要）で起動。
+  `ai/issue-N`ブランチをmainから強制リセットして作成し、AI生成タイトル・要約でPRを作成（以前は
+  全PRが`packages: address #N`という同じタイトルで区別できない問題があったため変更）。
+- **`ai-issue-autofix.yml`**：`check-light.yml`が自身のビルド失敗を検知して直接dispatchします
+  （`workflow_run`イベント連鎖には依存しません——設計初期にこの方式を検討しましたが、
+  `GITHUB_TOKEN`が作成したPRの初回ワークフロー実行には人間の手動承認が必要という仕様により
+  実際には一度も発火しないことが判明したため、直接dispatch方式に変更しました）。試行上限3回、
+  判定は`AI-Autofix-Attempt: true`という git trailerを持つコミット数で行います。
+- **`ai-issue-feedback.yml`**：PRへのコメントに、**リポジトリ所有者のものだけ**反応します。
+  修正をpushした後の追加返信コメントは基本的に行いません（Deep Interviewで確認済みの方針）。
+  唯一の例外は、アドバイザリスキャンが危険そうな構文を検出した場合——このときはラベルに加えて
+  PRコメントで明示的に注意喚起します。
+- **未検証の前提**：この開発環境にはGitHub Actionsを実行する手段が無く、実際にOpenRouter APIを
+  呼び出しての動作確認はできていません（`ai_pipeline.py`の各関数は単体テスト済み）。初回はテスト用
+  issueで試し、想定通り動くか確認することを強く推奨します。5ラウンドの専門家レビュー（Architect/
+  Critic）と、その後の追加スポットチェックを経てもなお新しいバグが見つかり続けたため
+  （`docs/article-log.md`参照）、実機での最初の動作確認は特に注意深く見守ってください。
 - **レビュー必須**：作成されるPRの本文にも明記していますが、AI生成の変更は必ず人間がレビューしてから
   マージしてください。`check-light.yml`のビルド検証も併せて確認すること。
-
-## CI失敗時の自動修正（`ai-issue-autofix.yml`）
-
-`ai-issue-handler.yml`が作ったPR（`ai/packages-issue-*`ブランチ）で`check-light`が失敗した場合、
-自動でAIに再修正させ、同じPRブランチに修正コミットをpushする仕組みです。
-
-- **トリガー**：`workflow_run`イベント。`check-light`が完了し`conclusion == 'failure'`、かつ
-  対象ブランチが`ai/packages-issue-`で始まる場合のみ発火します（人間の通常PRには反応しません）
-- **試行上限**：最大3回まで。判定はPRブランチのコミット数（`git rev-list --count origin/main..HEAD`）
-  で行い、外部の状態ストアは使いません。3回を超えて失敗する場合はPRにコメントを付けて自動修正を打ち切り、
-  人間のレビューに委ねます
-- **意図的な単純さ**：失敗原因が「パッケージ名の問題」か「Cachix認証やネットワーク等の無関係な問題」かは
-  区別しません（Deep Interviewでのユーザーの明示的な判断）。無関係な原因では3回とも無駄になりますが、
-  それによるAPI課金・時間のコストは許容範囲として受け入れています
-- **安全策**：`ai-issue-handler.yml`と同じ設計を踏襲（AIはJSON配列のパッケージ名のみ出力、識別子検証、
-  ファイルスコープの差分再確認、CIログはファイル経由で渡し`run:`ブロックに直接埋め込まない）
-- **注意**：`on.workflow_run.workflows`は`check-light.yml`の`name:`フィールド（`check-light`）と
-  完全一致させる必要があります。ワークフロー名を変更した場合はこちらも忘れず更新してください
-- **未検証**：これも同じ理由（この開発環境でGitHub Actionsを実行できない）で実地確認はできていません
 
 ## 未実装・既知の制限事項
 
 - GitHubリモート作成・Cachix接続はこのセッションでは行っていない
 - `check-desktop.yml` は手動トリガー（`workflow_dispatch`）専用。`modules/desktop.nix` が未実装のスタブのため、PRで自動実行されないようにしている
 - `check-light.yml` は `CACHIX_AUTH_TOKEN` が未設定の間、Cachixのステップで失敗する（想定通りであり、バグではない）
+- `tests/ai/default.nix` は許可パスとして予約されているだけで、`flake.nix`の`checks`には未配線（`flake.nix`はAI編集スコープ外のため、配線には人間の作業が必要）
+- 旧設計（PR #11, #13等、`ai/packages-issue-*`ブランチ・パッケージ名JSON配列方式）で作られたPRは、この新設計への移行対象外。人間が個別に対応すること
