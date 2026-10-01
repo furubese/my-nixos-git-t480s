@@ -104,9 +104,15 @@ material for a written article about building it — see "Article log" below).
   this exact checkout-ordering bug was caught and fixed in an extra post-consensus Architect
   review, so don't reorder these steps without re-verifying that interaction. It does **not**
   distinguish "AI wrote broken Nix" from "unrelated CI flake" (deliberate simplicity choice).
-  Attempt count is derived from commits carrying an `AI-Autofix-Attempt: true` trailer on
-  `origin/main..HEAD` (no external state store); cap is 3 attempts, after which it comments on
-  the PR and stops.
+  Attempt count is the number of **consecutive** `AI-Autofix-Attempt: true`-trailer commits
+  walking back from `HEAD` (no external state store), not the total count on
+  `origin/main..HEAD` — a feedback-triggered commit (no trailer) breaks the streak, so a
+  human nudging the PR via `ai-issue-feedback.yml` naturally re-arms a fresh 3-attempt
+  budget instead of requiring a separate reset mechanism. Cap is 3 consecutive attempts,
+  after which it comments on the PR and stops; the exhaustion comment itself is only
+  posted once per cycle (deduped by matching existing PR comments newer than the streak's
+  reset point), since `check-light` keeps re-dispatching autofix on every failure even
+  after the cap is hit and would otherwise repost the same comment endlessly.
 - `.github/workflows/ai-issue-feedback.yml` reacts to `issue_comment` on a PR, but only when
   the commenter is `github.repository_owner` and the `resolve` job confirms the PR is a
   same-repo, bot-authored `ai/issue-N` PR. After pushing a fix commit, it does **not** post a
