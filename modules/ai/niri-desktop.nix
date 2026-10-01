@@ -61,8 +61,15 @@
     ELECTRON_OZONE_PLATFORM_HINT = "wayland";
   };
 
-  # 日本語デスクトップに必要なCJKフォント
-  fonts.packages = [ pkgs.notofonts-cjk ];
+  # 日本語デスクトップに必要なCJKフォント。
+  # nixpkgsの正しい属性名は noto-fonts-cjk であり、notofonts-cjk は存在しない
+  # （このタイポが前回のCI失敗「attribute 'notofonts-cjk' missing」の原因）。
+  # CJKフォントが sans/serif に分割されたリビジョンでもビルドが通るよう、
+  # noto-fonts-cjk が無い場合は noto-fonts-cjk-sans にフォールバックする。
+  fonts.packages =
+    if pkgs ? noto-fonts-cjk then [ pkgs.noto-fonts-cjk ]
+    else if pkgs ? noto-fonts-cjk-sans then [ pkgs.noto-fonts-cjk-sans ]
+    else [ ];
 
   environment.systemPackages =
     [
