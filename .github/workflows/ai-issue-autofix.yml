@@ -76,13 +76,25 @@ jobs:
             echo "exhausted=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 試行上限に達した場合、PRにコメントしてエスカレーション
+      - name: 試行上限に達した場合、PRにコメントしてエスカレーション（未投稿の場合のみ）
         if: steps.attempts.outputs.exhausted == 'true'
         run: |
           pr_number=$(gh pr list --head "$BRANCH" --json number -q '.[0].number')
-          if [ -n "$pr_number" ]; then
-            gh pr comment "$pr_number" --body "自動修正を3回試みましたが、check-light.yml が引き続き失敗しています。これ以上の自動修正は行いません。人間によるレビュー・修正をお願いします（実行run_id: ${RUN_ID}）。"
+          if [ -z "$pr_number" ]; then
+            exit 0
           fi
+          # 試行上限到達後もcheck-lightが失敗するたびにこのジョブ自体は再dispatchされ続ける
+          # （check-light側は試行回数を知らないため）。このステップだけで再投稿を止めないと、
+          # 同じエスカレーションコメントが際限なく増えてしまう。
+          already_commented=$(
+            gh api --method GET "repos/$GH_REPO/issues/$pr_number/comments" \
+              --jq '[.[] | select(.body | startswith("自動修正を3回試みましたが"))] | length'
+          )
+          if [ "$already_commented" -gt 0 ]; then
+            echo "既にエスカレーションコメント済みのため再投稿しない。"
+            exit 0
+          fi
+          gh pr comment "$pr_number" --body "自動修正を3回試みましたが、check-light.yml が引き続き失敗しています。これ以上の自動修正は行いません。人間によるレビュー・修正をお願いします（実行run_id: ${RUN_ID}）。"
 
       - name: check-light完了を待ってから失敗ログを取得
         if: steps.attempts.outputs.exhausted == 'false'
