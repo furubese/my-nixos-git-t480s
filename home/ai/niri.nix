@@ -1,24 +1,14 @@
-# niriのユーザー側設定（Home Managerモジュール）
+# niri設定ファイルの配置（Home Manager側）。
 #
-# - ~/.config/niri/config.kdl を home/ai/niri-config.kdl から配置する
-# - カーソルテーマ（catppuccin frappe green / 32px）をGTKアプリ等にも反映する
-{ pkgs, lib, ... }:
+# 実体は home/ai/niri.kdl で、~/.config/niri/config.kdl として配置される。
+# niriはユーザー設定をシステム側設定(/etc/xdg)より優先して読むため、
+# 旧来のシステム側設定が残っていても常にこの設定が使われる。
+#
+# issue #64: Noctalia（C++実装の単体バイナリ）はこのKDL内のspawn-at-startupから
+# 直接起動する（旧Quickshell(QML)版の中間ツール経由の起動は廃止）。
+{ lib, ... }:
 {
-  xdg.configFile."niri/config.kdl".source = ./niri-config.kdl;
-
-  # カーソルテーマ。niri設定（cursor.xcursor-theme）と同一のものを指定。
-  # nixpkgsにcatppuccin-cursors.frappeGreenが存在しない場合はスキップされ、
-  # niri/GTKともデフォルトテーマへフォールバックする。
-  home.pointerCursor = lib.mkIf (pkgs ? catppuccin-cursors.frappeGreen) {
-    package = pkgs.catppuccin-cursors.frappeGreen;
-    name = "catppuccin-frappe-green-cursors";
-    size = 32;
-    gtk.enable = true;
-  };
-
-  # Waylandネイティブアプリ向けにカーソルテーマを明示
-  home.sessionVariables = {
-    XCURSOR_THEME = "catppuccin-frappe-green-cursors";
-    XCURSOR_SIZE = "32";
-  };
+  # niri設定はこのモジュールが所有する。他にniri設定を配置するモジュールが
+  # 残っていてもこの設定を優先させる。
+  home.file.".config/niri/config.kdl".source = lib.mkForce ./niri.kdl;
 }

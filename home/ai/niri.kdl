@@ -1,0 +1,94 @@
+// niri設定（home/ai/niri.nix から ~/.config/niri/config.kdl として配置される）
+//
+// issue #64: Noctaliaシェルの起動を更新。
+// 現行のNoctaliaはC++実装の単体バイナリのため、旧Quickshell(QML)版で必要だった
+// 中間ツール経由の起動は不要。niriのspawn-at-startupから直接起動する。
+// （パッケージは modules/ai/noctalia.nix でシステムプロファイルに入れてある）
+
+input {
+    keyboard-xkb {
+        // 日本語JIS配列（システムのX11キーマップに合わせる）
+        layout "jp"
+    }
+
+    touchpad {
+        // タップでクリック
+        tap
+    }
+}
+
+outputs {
+    // t480s内蔵ディスプレイ。必要に応じて追記する:
+    // eDP-1 {
+    //     scale 2.0
+    // }
+}
+
+layout {
+    gaps 8
+
+    center-focused-column "never"
+
+    preset-column-widths {
+        proportion 0.5
+        proportion 1.0
+    }
+
+    default-column-width {
+        proportion 0.5
+    }
+
+    focus-ring {
+        width 2
+        active-color "#f9c04a"
+        inactive-color "#505050"
+    }
+}
+
+// ---- スタートアップ ----
+// Noctalia（C++版・単体バイナリ）をniriセッションから直接起動する
+spawn-at-startup "noctalia"
+
+cursor {
+    xcursor-size 24
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+binds {
+    // 端末・ランチャー
+    Mod+T { spawn "foot"; }
+    Mod+D { spawn "fuzzel"; }
+
+    // ウィンドウ操作
+    Mod+Q { close-window; }
+    Mod+F { maximize-column; }
+    Mod+Shift+F { toggle-window-fullscreen; }
+
+    // フォーカス移動
+    Mod+Left { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up { focus-window-up; }
+    Mod+Down { focus-window-down; }
+
+    // ウィンドウ移動
+    Mod+Shift+Left { move-column-left; }
+    Mod+Shift+Right { move-column-right; }
+    Mod+Shift+Up { move-window-up; }
+    Mod+Shift+Down { move-window-down; }
+
+    // ワークスペース切替・移動
+    Mod+1 { switch-workspace 1; }
+    Mod+2 { switch-workspace 2; }
+    Mod+3 { switch-workspace 3; }
+    Mod+4 { switch-workspace 4; }
+    Mod+Shift+1 { move-column-to-workspace 1; }
+    Mod+Shift+2 { move-column-to-workspace 2; }
+    Mod+Shift+3 { move-column-to-workspace 3; }
+    Mod+Shift+4 { move-column-to-workspace 4; }
+
+    // niri終了
+    Mod+Shift+E { quit; }
+}
