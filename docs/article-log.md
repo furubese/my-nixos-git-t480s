@@ -147,3 +147,10 @@
 - ユーザーは(3)を選択。理由は明確で「世代は1で良い。githubで管理しているのだから」——NixOS自体のロールバック機能を手放す代わりに、設定変更の履歴・切り戻しはgit（`git revert`等）に委ねるという判断。このリポジトリ自体がgitで設定を管理する構成である以上、筋の通った割り切り方だった
 - `modules/boot.nix`（`boot.loader.systemd-boot.configurationLimit = 1;`）を新規作成し、`hosts/t480s/configuration.nix`のimportsに追加。パーティション操作という実機への不可逆リスクを一切取らずに解決した
 - **この一連のやり取りで得た教訓**：診断の初手で状況を決めつけて対応（`configurationLimit = 5`での書き込み）を始めてしまい、ユーザーに一度止められた。実機の物理的な制約（パーティションレイアウト等）はリポジトリのコードから読み取れない情報であり、勝手に推測せず先に実態を確認すべきだった、という反省点
+
+## 実機トラブル（続き）：修正後switch成功後もniri/greetdが起動しない
+
+- PR #20（`configurationLimit = 1`）マージ後、`git pull && sudo nixos-rebuild switch --flake .`が成功しrebootしたが、ログイン画面はtuigreet（テキストUIの専用グリーター）ではなく従来通りのコンソールログインのまま、ログイン後もzshが起動するだけでniriは一切立ち上がらなかった
+- `systemctl status greetd` →「Unit greetd could not be found」。ソース側（`modules/ai/niri-desktop.nix`の`services.greetd.enable = true`、`modules/ai/default.nix`の自動import、`hosts/t480s/configuration.nix`のimports）はすべてGitHub上で確認済みで問題なし、実機のリポジトリも最新に同期済みであることも確認したが、それでも`nix-store -q --requisites /run/current-system | grep -i greetd`が**空**——つまり「現在起動中のgenerationは最新のはずなのに、その中身にgreetdが含まれていない」という食い違いが実測で確定した
+- 原因の特定はできなかったが（ブートローダーの容量エラー騒動の直後だったため、switch処理の内部状態に何らかの一時的な不整合があった可能性が高い、程度の推測にとどまる）、その場で`sudo nixos-rebuild switch --flake . --show-trace`を素直にもう一度実行し、再起動したところ解決した
+- **教訓**：`nixos-rebuild switch`が「成功」と表示されても、実際に反映されたかどうかは`nix-store -q --requisites /run/current-system`のような直接的な検証で確認しないと分からないことがある、という実例。原因不明のまま「もう一度やり直す」で解決するケースも実運用ではあり得るが、記事としては「なぜ直ったかは特定できていない」という限界も正直に記録しておく
