@@ -1,0 +1,75 @@
+// zellij設定 (issue #43)
+// tmuxのデフォルトキーバインドと同じ操作感にするための設定。
+// プリフィックスはtmux標準の Ctrl-b。押すとzellijの「tmuxモード」に入り、
+// 続けて押すキーがtmuxの「プリフィックス + キー」に対応する。
+//
+// このkeybindsセクションはzellijデフォルトのキーバインドとマージされるため、
+// zellij独自のモード切替(Ctrl-p: ペイン / Ctrl-t: タブ / Ctrl-n: リサイズ /
+// Ctrl-s: スクロール / Ctrl-o: セッション)も引き続き使える。
+
+// ペインの枠線を消してtmuxに近い見た目にする
+pane_frames false
+
+// ステータスバーを1行にまとめるコンパクトレイアウト
+default_layout "compact"
+
+keybinds {
+    normal {
+        // tmuxのプリフィックス: Ctrl-b でtmuxモードに入る
+        bind "Ctrl b" { SwitchToMode "tmux"; }
+    }
+
+    // tmuxモード = tmuxの「プリフィックス + キー」に相当
+    tmux {
+        // プリフィックス再押下 / Esc / Enter でモードを抜ける
+        bind "Ctrl b" { SwitchToMode "normal"; }
+        bind "Escape" { SwitchToMode "normal"; }
+        bind "Enter" { SwitchToMode "normal"; }
+
+        // --- ペイン分割 (tmux: prefix " 上下分割 / prefix % 左右分割) ---
+        bind "\"" { NewPane "down"; }
+        bind "%" { NewPane "right"; }
+
+        // --- フォーカス移動 (tmux: prefix + 方向キー / o 次のペイン / ; 前のペイン) ---
+        bind "Left" { MoveFocus "left"; }
+        bind "Right" { MoveFocus "right"; }
+        bind "Up" { MoveFocus "up"; }
+        bind "Down" { MoveFocus "down"; }
+        bind "o" { FocusNextPane; }
+        bind ";" { FocusPreviousPane; }
+
+        // --- ペイン入れ替え (tmux: prefix { / }) ---
+        bind "{" { MovePane "back"; }
+        bind "}" { MovePane; }
+
+        // --- ペイン操作 ---
+        bind "x" { CloseFocus; }              // tmux: prefix x ペインを閉じる
+        bind "z" { ToggleFocusFullscreen; }   // tmux: prefix z ズーム切替
+        bind "!" { BreakPane; }               // tmux: prefix ! ペインを新タブへ切り出す
+
+        // --- タブ (tmuxのウィンドウに相当) ---
+        bind "c" { NewTab; }           // tmux: prefix c 新規ウィンドウ
+        bind "n" { GoToNextTab; }      // tmux: prefix n 次のウィンドウ
+        bind "p" { GoToPreviousTab; }  // tmux: prefix p 前のウィンドウ
+        bind "l" { ToggleTab; }        // tmux: prefix l 直前のウィンドウ
+        bind "&" { CloseTab; }         // tmux: prefix & ウィンドウを閉じる
+        bind "," { TabNameInput; }     // tmux: prefix , ウィンドウ名変更
+
+        // タブ番号への移動 (tmux: prefix 0-9)
+        // ※zellijのタブ番号は1始まり。1-9はそのまま対応し、0は10番目のタブ
+        bind "1" { GoToTab 1; }
+        bind "2" { GoToTab 2; }
+        bind "3" { GoToTab 3; }
+        bind "4" { GoToTab 4; }
+        bind "5" { GoToTab 5; }
+        bind "6" { GoToTab 6; }
+        bind "7" { GoToTab 7; }
+        bind "8" { GoToTab 8; }
+        bind "9" { GoToTab 9; }
+        bind "0" { GoToTab 10; }
+
+        // --- セッション / コピー ---
+        bind "d" { Detach; }                // tmux: prefix d デタッチ
+        bind "[" { SwitchToMode "scroll"; } // tmux: prefix [ コピーモード(スクロール)
+    }
+}
