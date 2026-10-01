@@ -28,6 +28,11 @@
   fonts.packages = [ pkgs.noto-fonts-cjk-sans ];
 
   # Noto Sans CJK は中韓台の字形も含むため、日本語テキストには日本語字形 (JP) が
-  # 使われるよう、fontconfig の既定フォントに指定しておく
-  fonts.fontconfig.defaultFonts.japanese = [ "Noto Sans CJK JP" ];
+  # 使われるよう、fontconfig の既定フォントを指定しておく。
+  # 注: fonts.fontconfig.defaultFonts に japanese のような言語別のキーは存在しない
+  # ため、実際に定義されている sansSerif / monospace で指定する。
+  fonts.fontconfig.defaultFonts = {
+    sansSerif = [ "DejaVu Sans" "Noto Sans CJK JP" ];
+    monospace = [ "DejaVu Sans Mono" "Noto Sans Mono CJK JP" ];
+  };
 }
