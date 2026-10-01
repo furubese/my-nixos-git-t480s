@@ -62,10 +62,11 @@
   };
 
   # 日本語デスクトップに必要なCJKフォント。
-  # nixpkgsの正しい属性名は noto-fonts-cjk であり、notofonts-cjk は存在しない
-  # （このタイポが前回のCI失敗「attribute 'notofonts-cjk' missing」の原因）。
+  # CI失敗「attribute 'notofonts-cjk' missing」の原因は、nixpkgsに存在しない属性
+  # pkgs.notofonts-cjk を参照していたこと。正しい属性名は noto-fonts-cjk。
   # CJKフォントが sans/serif に分割されたリビジョンでもビルドが通るよう、
-  # noto-fonts-cjk が無い場合は noto-fonts-cjk-sans にフォールバックする。
+  # noto-fonts-cjk が無い場合は noto-fonts-cjk-sans にフォールバックし、
+  # いずれも存在しない場合は空リストとして評価エラーを回避する。
   fonts.packages =
     if pkgs ? noto-fonts-cjk then [ pkgs.noto-fonts-cjk ]
     else if pkgs ? noto-fonts-cjk-sans then [ pkgs.noto-fonts-cjk-sans ]
