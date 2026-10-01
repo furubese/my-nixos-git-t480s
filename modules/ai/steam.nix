@@ -40,8 +40,16 @@
     modesetting.enable = true;
     # サスペンド/レジューム時の VRAM 退避（ノートPC運用での安定化）
     powerManagement.enable = true;
-    # Turing 世代以降の新しい GPU では hardware.nvidia.open = true
-    # （オープンカーネルモジュール）も選択肢。古い GPU はデフォルト
-    # （プロプライエタリカーネルモジュール）のまま使う。
+    # カーネルモジュール種別（プロプライエタリ / オープン）の明示指定。
+    #
+    # CI失敗の修正: 現行 nixpkgs では hardware.nvidia.open のデフォルトは
+    # null（未指定）で、この状態で NVIDIA モジュール内の assertion
+    #   !cfg.open || (nvidia_x11.open != null)
+    # を評価すると「expected a Boolean but found null」でビルドが落ちる。
+    # そのため open は必ず true/false で明示する必要がある。
+    # T480s 搭載の dGPU (GeForce MX150, Pascal 世代) はオープンカーネル
+    # モジュールの対応対象（Turing 以降）外のため、プロプライエタリ側
+    # (=false) を指定する。
+    open = false;
   };
 }
