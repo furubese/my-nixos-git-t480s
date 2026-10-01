@@ -12,7 +12,9 @@ let
   # modules/ai/japanese-input.nix の i18n.inputMethod.fcitx5.addons と同じ構成。
   # fcitx5-with-addons にしておくと、このservice単体で起動しても
   # Mozc アドオンを発見できる
-  fcitx5Package = pkgs.fcitx5-with-addons.override {
+  # 注: fcitx5-with-addons は nixpkgs のエイリアス整理 (2025-10-27) で
+  # qt6Packages 配下へ移動したため、pkgs.qt6Packages.fcitx5-with-addons を使う
+  fcitx5Package = pkgs.qt6Packages.fcitx5-with-addons.override {
     addons = [ pkgs.fcitx5-mozc ];
   };
 in
