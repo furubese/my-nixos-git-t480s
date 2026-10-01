@@ -44,11 +44,19 @@ jobs:
     steps:
       - id: pr
         run: |
-          branch=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)
-          is_cross=$(gh pr view "$PR_NUMBER" --json isCrossRepository -q .isCrossRepository)
-          author=$(gh pr view "$PR_NUMBER" --json author -q .author.id)
+          # REST（gh pr view --json author ではない）: author.idはGraphQLの不透明なノードIDで、
+          # 文字列"github-actions"と一致することはない（ai-issue-autofix.ymlで実際に100%失敗していた
+          # バグと同じ原因）。この開発環境でREST APIを直接検証した結果、github-actions作成のPRは
+          # user.login == "github-actions[bot]" かつ user.type == "Bot" になることを確認済み。
+          IFS='|' read -r branch head_repo author_login author_type <<< "$(
+            gh api "repos/$GH_REPO/pulls/$PR_NUMBER" \
+              --jq '[.head.ref, .head.repo.full_name, .user.login, .user.type] | join("|")'
+          )"
           proceed=false
-          if [[ "$branch" =~ ^ai/issue-[0-9]+$ ]] && [ "$is_cross" = "false" ] && [ "$author" = "github-actions" ]; then
+          if [[ "$branch" =~ ^ai/issue-[0-9]+$ ]] \
+            && [ "$head_repo" = "$GH_REPO" ] \
+            && [ "$author_login" = "github-actions[bot]" ] \
+            && [ "$author_type" = "Bot" ]; then
             proceed=true
           fi
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
