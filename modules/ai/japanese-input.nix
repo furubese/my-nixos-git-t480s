@@ -21,7 +21,10 @@
   };
 
   # fcitx5 のGUI設定ツール（トリガーキーの変更、Mozcの設定等）
-  environment.systemPackages = [ pkgs.fcitx5-configtool ];
+  # 注: fcitx5-configtool は 2025-10-27 の nixpkgs 変更でトップレベル属性から
+  #   qt6Packages スコープへ移動されたため、pkgs.qt6Packages.fcitx5-configtool を
+  #   参照する（fcitx5-with-addons と同様の対応）。
+  environment.systemPackages = [ pkgs.qt6Packages.fcitx5-configtool ];
 
   # 入力した日本語を画面に表示するためのCJKフォント。
   # これがないと変換はできても文字が豆腐（□）になる
