@@ -18,6 +18,7 @@ merge.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -163,18 +164,30 @@ def validate_dispatch(branch: str, run_id: str):
         print(f"::error::branch '{branch}' does not match ^{BRANCH_PATTERN}$. Refusing.")
         sys.exit(1)
 
+    repo = os.environ.get("GH_REPO", "")
+    owner = repo.split("/", 1)[0] if "/" in repo else ""
+    if not owner:
+        print("::error::GH_REPO is not set to '<owner>/<repo>'. Refusing.")
+        sys.exit(1)
+
+    # REST (not `gh pr list --json author`, whose GraphQL-backed author object's
+    # exact field shape for bot-authored PRs was never verified against this repo
+    # and is not worth guessing at): confirmed directly against this repo that
+    # GitHub-Actions-authored PRs have user.login == "github-actions[bot]" and
+    # user.type == "Bot".
     prs = _gh_json(
-        ["pr", "list", "--head", branch, "--json", "isCrossRepository,author,number"]
+        ["api", f"repos/{repo}/pulls", "-f", f"head={owner}:{branch}", "-f", "state=all"]
     )
     matching = [
         pr
         for pr in prs
-        if not pr.get("isCrossRepository", True)
-        and pr.get("author", {}).get("id") == "github-actions"
+        if pr.get("head", {}).get("repo", {}).get("full_name") == repo
+        and pr.get("user", {}).get("login") == "github-actions[bot]"
+        and pr.get("user", {}).get("type") == "Bot"
     ]
     if not matching:
         print(
-            f"::error::no same-repo PR authored by the github-actions app found "
+            f"::error::no same-repo PR authored by github-actions[bot] found "
             f"for head branch '{branch}'. Refusing."
         )
         sys.exit(1)

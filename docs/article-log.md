@@ -154,3 +154,13 @@
 - `systemctl status greetd` →「Unit greetd could not be found」。ソース側（`modules/ai/niri-desktop.nix`の`services.greetd.enable = true`、`modules/ai/default.nix`の自動import、`hosts/t480s/configuration.nix`のimports）はすべてGitHub上で確認済みで問題なし、実機のリポジトリも最新に同期済みであることも確認したが、それでも`nix-store -q --requisites /run/current-system | grep -i greetd`が**空**——つまり「現在起動中のgenerationは最新のはずなのに、その中身にgreetdが含まれていない」という食い違いが実測で確定した
 - 原因の特定はできなかったが（ブートローダーの容量エラー騒動の直後だったため、switch処理の内部状態に何らかの一時的な不整合があった可能性が高い、程度の推測にとどまる）、その場で`sudo nixos-rebuild switch --flake . --show-trace`を素直にもう一度実行し、再起動したところ解決した
 - **教訓**：`nixos-rebuild switch`が「成功」と表示されても、実際に反映されたかどうかは`nix-store -q --requisites /run/current-system`のような直接的な検証で確認しないと分からないことがある、という実例。原因不明のまま「もう一度やり直す」で解決するケースも実運用ではあり得るが、記事としては「なぜ直ったかは特定できていない」という限界も正直に記録しておく
+
+## 実運用バグ発覚：AI Autofix/Feedbackが一度も動いていなかった（作成者判定の実装ミス）
+
+- その後issue #24〜#52系列を次々試す中で（docker, zellij, GitButler, Steam, 日本語入力等）、ユーザーから「いくつかissueを投げたが、PRでAI Autofixがうまく動いていない」と報告。`/deep-interview`で調査を開始
+- 「探索（explore）してから聞く」の原則に従い、ユーザーに聞く前にGitHub Actions APIで実行履歴を直接確認したところ、**直近10回の`ai-issue-autofix.yml`実行が、すべて同一ステップ「入力検証（validate-dispatch）」で100%失敗**していることが判明（間欠的ではなく確定的なバグ）
+- 原因：`.github/scripts/ai_pipeline.py`の`validate_dispatch`内、`pr.get("author", {}).get("id") == "github-actions"`という比較。`gh pr list --json author`が返す`author.id`はGraphQLの不透明なノードIDであり、文字列`"github-actions"`と一致することは原理上あり得ない——**実質的に常にFalseになる、autofix実装当初から一度も機能していなかったバグ**だった
+- 実際にREST API（`GET /repos/.../pulls/49`）を直接叩いて確認したところ、github-actions作成のPRは`user.login == "github-actions[bot]"`、`user.type == "Bot"`になることを実証。この値を根拠に判定ロジックを書き直した（`gh pr list`のGraphQLベースの`author`フィールドの正確な形は未検証のまま使わず、実際に確認済みのREST APIフィールドに寄せた）
+- ソースコードを確認した際、**同じ比較パターン（`author.id == "github-actions"`）が`ai-issue-feedback.yml`のresolveジョブにも存在する**ことを発見。まだ実際には失敗事例として報告されていなかったが（PRコメントでの修正依頼を誰も試していなかったため）、同じ原因で常に拒否されるはずだった。ユーザーに確認し、修正対象に追加
+- この回は「設計判断ではなく実装バグの修正」という性質上、omc-planコンセンサス（Architect/Critic）は使わず、ユーザーの明示的な選択により対話内で直接修正・GitButlerでコミットする、より軽量なフローを取った
+- **教訓**：これまでの5ラウンド＋αのレビューでは、`validate_dispatch`のロジック自体は（単体テストも書いた上で）「正しそう」に見えていたが、`gh`コマンドが実際に返すJSON構造の細部（GraphQLの`author.id`が何を意味するか）は、この開発環境に`gh`が無く一度も実行検証できなかった。レビューでいくら議論しても、実際に動かして初めて発覚する類のバグがあり、今回もその通りになった
