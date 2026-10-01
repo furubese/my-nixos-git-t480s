@@ -35,8 +35,12 @@
   # シークレット保存（NetworkManager等のパスワード用）
   services.gnome.gnome-keyring.enable = true;
 
-  # スクリーンロッカー（PAM設定込みで導入される）
-  programs.swaylock.enable = true;
+  # スクリーンロッカー（swaylock）。
+  # 現行nixpkgsに programs.swaylock オプションは存在しない（CI失敗の原因）。
+  # そのため、オプションが内部で行っていたのと等価の設定を手動で行う:
+  #   - PAMサービス定義（ロック解除時のパスワード認証に必要）
+  #   - パッケージ導入（environment.systemPackages に追加）
+  security.pam.services.swaylock = { };
 
   # 音声: PipeWire（wpctlによる音量制御が依存）
   services.pipewire = {
@@ -58,12 +62,13 @@
   };
 
   # 日本語デスクトップに必要なCJKフォント
-  fonts.packages = [ pkgs.noto-fonts-cjk ];
+  fonts.packages = [ pkgs.notofonts-cjk ];
 
   environment.systemPackages =
     [
       pkgs.alacritty # ターミナル（niriのMod+T）
       pkgs.fuzzel # アプリランチャー（niriのMod+D）
+      pkgs.swaylock # スクリーンロッカー（niriのSuper+Alt+L）
       pkgs.brightnessctl # 輝度キー用
       pkgs.playerctl # メディアキー用
       pkgs.xwayland-satellite # X11アプリ用（niriが自動起動する）
