@@ -175,8 +175,20 @@ def validate_dispatch(branch: str, run_id: str):
     # and is not worth guessing at): confirmed directly against this repo that
     # GitHub-Actions-authored PRs have user.login == "github-actions[bot]" and
     # user.type == "Bot".
+    # `gh api` defaults to POST (not GET) as soon as any -f/-F field is given,
+    # so --method GET must be explicit here or this silently hits the "create a
+    # pull request" endpoint instead of "list pull requests".
     prs = _gh_json(
-        ["api", f"repos/{repo}/pulls", "-f", f"head={owner}:{branch}", "-f", "state=all"]
+        [
+            "api",
+            "--method",
+            "GET",
+            f"repos/{repo}/pulls",
+            "-f",
+            f"head={owner}:{branch}",
+            "-f",
+            "state=all",
+        ]
     )
     matching = [
         pr
