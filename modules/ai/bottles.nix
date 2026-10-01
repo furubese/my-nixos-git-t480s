@@ -22,7 +22,7 @@
       glib
       libGL # OpenGL（libglvnd経由）
       libdrm
-      libpulse # winepulse.drv（PipeWire/PulseAudioオーディオ）
+      libpulseaudio # winepulse.drv（PipeWire/PulseAudioオーディオ）
       libxkbcommon
       mesa # GLベンダー（libGLX_mesa等）の発見用
       stdenv.cc.cc # libstdc++ / libgcc_s
