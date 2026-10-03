@@ -10,13 +10,16 @@ name: AI Issue Feedback
 #   （所有者のコメントであっても、無関係な通常PRへのコメントでは絶対に動かないようにする）。
 # - AIの書き込み対象・検証方法は ai-issue-handler.yml / ai-issue-autofix.yml と同一
 #   （modules/ai/**, home/ai/**, tests/ai/** への path allow-list、構文チェックのみ、
-#   advisory contentスキャン）。
+#   advisory contentスキャン）。実際の編集ループは3ワークフロー共通の
+#   `.github/scripts/glm_agent.py`（_trusted からのみ読み込む）が担う。
 # - 修正コミットをpushした後、AIからの追加の返信コメントは行わない（Deep Interview
 #   Round 10で確認済みの方針）。唯一の例外は、advisory content scanが危険そうな構文を
 #   検出した場合——このときはラベルに加えてPRコメントで明示的に注意喚起する
 #   （コンセンサス中にユーザーの明示的な同意を得た例外）。
 # - PRコメント本文（コメント投稿者は所有者に限定済みとはいえ）はAIプロンプトに渡す前に
 #   sanitize_text() を通す（HTMLコメント除去等、他の入力経路と扱いを揃えるため）。
+# - commit_trailer は意図的に付けない（None）。ai-issue-autofix.yml の
+#   「トレーラーなしコミット＝人間介入によるリセット」契約を維持するため。
 on:
   issue_comment:
     types: [created]
@@ -32,7 +35,8 @@ jobs:
     if: >
       github.event.issue.pull_request != null &&
       github.event.comment.user.login == github.repository_owner &&
-      vars.AI_PIPELINE_ENABLED == 'true'
+      vars.AI_PIPELINE_ENABLED == 'true' &&
+      vars.AI_AGENT_LOOP_FEEDBACK == 'true'
     runs-on: ubuntu-latest
     outputs:
       branch: ${{ steps.pr.outputs.branch }}
@@ -66,6 +70,7 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.proceed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     concurrency:
       group: ai-branch-${{ needs.resolve.outputs.branch }}
     env:
@@ -78,7 +83,7 @@ jobs:
     steps:
       - name: 対象PRブランチをcheckout
         uses: actions/checkout@v4
-        with: { ref: "${{ needs.resolve.outputs.branch }}", fetch-depth: 0 }
+        with: { ref: "${{ needs.resolve.outputs.branch }}", fetch-depth: 0, persist-credentials: false }
 
       - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
         run: echo '_trusted/' >> .git/info/exclude
@@ -89,132 +94,57 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
 
-      - name: OpenRouter (GLM 5.3) にフィードバック反映を依頼し、許可パスへ書き込む
+      - name: niriをflake.lockのピンに従ってインストール（run_commandでのniri validate用）
+        timeout-minutes: 5
+        run: nix profile install --inputs-from . nixpkgs#niri
+
+      - name: git設定にcredentialの痕跡が残っていないことを確認（エージェントループ実行前）
+        run: |
+          if git config --get-regexp '^http\..*extraheader' >/dev/null 2>&1; then
+            echo "::error::credential leak detected: http.*.extraheader is set in .git/config"
+            exit 1
+          else
+            echo "(no extraheader — OK)"
+          fi
+          origin_url="$(git config --get remote.origin.url)"
+          if [[ "$origin_url" == *"x-access-token:"* || "$origin_url" == *"@"* ]]; then
+            echo "::error::credential leak detected: remote.origin.url contains an embedded token"
+            exit 1
+          else
+            echo "(remote.origin.url clean — OK)"
+          fi
+
+      - name: OpenRouter (GLM 5.3) エージェントループでフィードバックを反映し、許可パスへ書き込む
         run: |
           python3 <<'PYEOF'
-          import glob
-          import json
           import os
-          import re
           import sys
-          import urllib.request
 
           sys.path.insert(0, "_trusted/.github/scripts")
           import ai_pipeline  # noqa: E402
+          import glm_agent  # noqa: E402
 
-          runner_temp = os.environ["RUNNER_TEMP"]
           comment = ai_pipeline.sanitize_text(os.environ.get("COMMENT_BODY", ""), max_len=2000)
-          api_key = os.environ["OPENROUTER_API_KEY"]
 
-          ai_files = {}
-          for pattern in ("modules/ai/*", "home/ai/*", "tests/ai/*"):
-              for path in glob.glob(pattern):
-                  if os.path.isfile(path) and os.path.basename(path) != "default.nix":
-                      ai_files[path] = open(path, encoding="utf-8").read()
-          current_block = "\n\n".join(
-              f"--- {path} ---\n{content}" for path, content in ai_files.items()
-          ) or "(no AI-managed files currently exist)"
-
-          prompt = f"""あなたはNixOS設定リポジトリのPRに対する人間のフィードバックを反映する
-          アシスタントです。以下は、このPRであなたが以前に生成した
-          modules/ai/**, home/ai/**, tests/ai/** 配下のファイル（書き込める範囲はこの3
-          ディレクトリの直下のみ、ネスト禁止）と、リポジトリ所有者からのPRコメントです。
-
-          {current_block}
+          initial_message = f"""これはこのPRへの、リポジトリ所有者からのPR会話コメントです。
+          あなたが以前このPRで modules/ai/**, home/ai/**, tests/ai/** 配下に生成した
+          ファイルについて、以下のコメントの指摘を反映してください。
 
           --- リポジトリ所有者からのPRコメント ---
           {comment}
-
-          コメントの指摘を反映した「変更後の完全なファイル内容」を、変更が必要なファイルに
-          ついてのみ出力してください（変更不要なファイルは含めない）。新しいファイルを
-          追加しても構いませんが、パスは modules/ai/**, home/ai/**, tests/ai/** の直下のみです。
-
-          出力は以下のスキーマのJSONオブジェクト1つのみとしてください。説明文・
-          コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと：
-          {{
-            "files": {{ "<許可パス>": "<ファイルの完全な内容>", ... }},
-            "title": "<今回の修正を要約した短い説明（日本語可）>",
-            "summary": "<何をどう修正したかの要約>"
-          }}
           """
 
-          req = urllib.request.Request(
-              "https://openrouter.ai/api/v1/chat/completions",
-              data=json.dumps({
-                  "model": "z-ai/glm-5.3",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0,
-              }).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
-          )
-
-          with urllib.request.urlopen(req, timeout=120) as resp:
-              response = json.load(resp)
-
-          raw = response["choices"][0]["message"]["content"].strip()
-          print(f"AI raw response: {raw}")
-
-          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
-          if fence_match:
-              raw = fence_match.group(1).strip()
-
-          try:
-              result = json.loads(raw)
-          except json.JSONDecodeError:
-              print(f"::error::AIの応答がJSONとして解釈できません: {raw!r}")
+          result = glm_agent.run_agent_loop(initial_message, commit_trailer=None)
+          if result["aborted"]:
               sys.exit(1)
-
-          if not isinstance(result, dict) or "files" not in result:
-              print("::error::AIの応答に'files'キーがありません。中断します。")
-              sys.exit(1)
-
-          files = result["files"]
-          title = str(result.get("title") or "feedback")[:100]
-          summary = str(result.get("summary") or "(要約なし)")[:2000]
-
-          if not isinstance(files, dict) or not files:
-              print("::error::filesが空です。コメントから具体的な修正を読み取れなかった可能性があります。中断します。")
-              sys.exit(1)
-
-          violations = ai_pipeline.validate_paths(list(files.keys()))
-          if violations:
-              print(f"::error::許可リスト外のパスが含まれています: {violations}。中断します。")
-              sys.exit(1)
-
-          for path, content in files.items():
-              if not isinstance(content, str):
-                  print(f"::error::{path} の内容が文字列ではありません。中断します。")
-                  sys.exit(1)
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(content)
-              print(f"wrote {path} ({len(content)} bytes)")
-
-          with open(os.path.join(runner_temp, "expected_files.txt"), "w", encoding="utf-8") as f:
-              f.write("\n".join(sorted(files.keys())))
-          with open(os.path.join(runner_temp, "commit_msg.txt"), "w", encoding="utf-8") as f:
-              f.write(f"feedback: {title}\n\n{summary}\n\nAI-generated from PR review feedback.\n")
           PYEOF
 
-      - name: 変更が許可リスト・AI申告パスと完全一致することを検証
+      - name: 変更が許可リストに一致することを再検証（diffベース、rename対応）
         run: |
           git add -A
-          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged_files.txt"
-          sort "$RUNNER_TEMP/expected_files.txt" > "$RUNNER_TEMP/expected_files_sorted.txt"
-          if [ ! -s "$RUNNER_TEMP/staged_files.txt" ]; then
-            echo "::error::変更がありませんでした。中断します。"
-            exit 1
-          fi
-          if ! diff -q "$RUNNER_TEMP/staged_files.txt" "$RUNNER_TEMP/expected_files_sorted.txt" > /dev/null; then
-            echo "::error::実際に変更されたファイルがAI申告分と一致しません。"
-            echo "staged:"; cat "$RUNNER_TEMP/staged_files.txt"
-            echo "expected:"; cat "$RUNNER_TEMP/expected_files_sorted.txt"
-            exit 1
-          fi
+          git diff --cached --no-renames -z --name-status \
+            | python3 _trusted/.github/scripts/ai_pipeline.py check-diff \
+            > "$RUNNER_TEMP/staged_files.txt"
 
       - name: Nix構文チェック（括弧バランス等。ビルド検証自体はcheck-light.ymlに委ねる）
         run: |
@@ -256,8 +186,14 @@ jobs:
         run: |
           git config user.name "ai-issue-handler[bot]"
           git config user.email "ai-issue-handler@users.noreply.github.com"
-          git commit -F "$RUNNER_TEMP/commit_msg.txt"
-          git push origin "HEAD:$BRANCH"
+          {
+            echo -n "feedback: "
+            cat "$RUNNER_TEMP/commit_msg.txt"
+            echo
+            echo "AI-generated from PR review feedback."
+          } > "$RUNNER_TEMP/commit_msg_final.txt"
+          git commit -F "$RUNNER_TEMP/commit_msg_final.txt"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "HEAD:$BRANCH"
 
       - name: アドバイザリスキャンでヒットがあれば、ラベルと注意喚起コメントを付ける（唯一の返信例外）
         run: |

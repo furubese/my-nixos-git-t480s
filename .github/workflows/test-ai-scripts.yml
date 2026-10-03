@@ -1,0 +1,24 @@
+name: test-ai-scripts
+
+# .github/scripts/ 配下（ai_pipeline.py・glm_agent.py）のセキュリティ境界ロジックに対する
+# 単体テスト。check-light.yml は `paths:` フィルタに `.github/**` を含まないため、
+# このワークフローは独立して追加する（check-light.yml の拡張では対象PRで実行されない）。
+
+on:
+  pull_request:
+    paths: ['.github/scripts/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: run .github/scripts unit tests
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*.py' -v

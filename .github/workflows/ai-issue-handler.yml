@@ -1,26 +1,45 @@
 name: AI Issue Handler
 
-# セキュリティ設計（v2: 自由なNixコード生成に対応した版。旧版はパッケージ名JSON配列のみ出力させていた）:
-# - トリガーは `labeled` イベントのみ。GitHubのデフォルト権限では、issueへのラベル付与には
-#   triage/write権限が必要なため、公開リポジトリで誰でも作成できる issue 本文だけでは
-#   このワークフローは起動しない（`package-request` ラベルを付けられる=信頼できる人だけが起動できる）。
+# セキュリティ設計（v3: 共有エージェントループ glm_agent.py への移行版。旧版は固定5ファイルの
+# context を渡すだけの単発OpenRouter呼び出しだった）:
+# - トリガーは `issues: labeled` イベント、または `workflow_dispatch`（issue_number入力、
+#   手動実行用）。`labeled` はGitHubのデフォルト権限では issue へのラベル付与に triage/write
+#   権限が必要なため、公開リポジトリで誰でも作成できる issue 本文だけではこのワークフローは
+#   起動しない（`package-request` ラベルを付けられる=信頼できる人だけが起動できる）。
+#   `workflow_dispatch` は actions:write 権限を持つ人のみ実行可能。`inputs.issue_number` は
+#   チェックアウトより前の専用ステップで `^[1-9][0-9]*$` に一致することを検証する
+#   （`type: number` はUI入力補助に過ぎず、GitHub REST経由のdispatchでは任意の文字列を渡せる
+#   ため強制力を持たない）。
 # - issue本文・タイトルは信頼できない入力として扱う。シェルの `run:` ブロックに直接
-#   `${{ github.event.issue.body }}` を埋め込まない。必ず `env:` 経由で渡し、Python側で
-#   ai_pipeline.sanitize_text() を通してから使う。
-# - AI（OpenRouter経由のGLM 5.3）は自由なNixコードを生成してよい。ただし：
-#     1. 出力できるファイルパスは modules/ai/**, home/ai/**, tests/ai/**（直下のみ、ネスト禁止）
-#        に限定し、.github/scripts/ai_pipeline.py の allow-list で機械的に検証する。
-#     2. これはサンドボックスではない（許可パス内でも任意のNixOSオプションを設定できる）。
+#   `${{ github.event.issue.body }}` を埋め込まない。`labeled` 時はstep-level `env:` 経由で
+#   受け取って `printf` で、`workflow_dispatch` 時は `gh api` の出力をリダイレクトで、それぞれ
+#   `$RUNNER_TEMP/issue_title.txt` / `issue_body.txt` に書き出す（`$GITHUB_ENV` は使わない。
+#   複数行の本文に `KEY=VALUE` 区切りを仕込んで任意の環境変数を注入される経路になるため）。
+#   Python側はこの2ファイルを読み、`ai_pipeline.sanitize_text()` を通してから使う。
+# - AI（OpenRouter経由のGLM 5.3、`.github/scripts/glm_agent.py` の共有エージェントループ）は
+#   list/read/write/delete/run の各ツールで自律的にリポジトリを調べ、変更し、検証する。
+#     1. 書き込み・削除できるファイルパスは modules/ai/**, home/ai/**, tests/ai/**（直下のみ、
+#        ネスト禁止）に限定され、glm_agent.py が ai_pipeline.py の allow-list で機械的に検証
+#        する。ループ終了後も同じ allow-list でステージされた差分を再検証する（最終防御）。
+#     2. これはサンドボックスではない（許可パス内でも任意のNixOSオプションを設定できる。
+#        run_command も niri/nix/nix-instantiate の許可リスト内で任意引数を実行できる）。
 #        実質的な防御線は、マージ前に人間がPRの全差分を読むこと。
 #     3. 生成後は構文チェックのみ（nix-instantiate --parse）を行う。実際のビルド検証は
 #        既存の check-light.yml に委ね、ここでは重複したビルドを行わない。
 #     4. 危険そうな構文（ai_pipeline.py の advisory scan）を検出した場合はPRにラベルを
 #        付けるだけで、生成自体をブロックはしない（ブロックできるほど正規表現は信頼できない）。
-# - 検証ロジック（.github/scripts/ai_pipeline.py）は必ず main からのみ取得する（path: _trusted）。
+# - 検証ロジック（ai_pipeline.py / glm_agent.py）は必ず main からのみ取得する（path: _trusted）。
 #   このブランチ自身がその検証ロジックを書き換えて自己正当化することはできない。
+# - pushはURL引数にのみトークンを埋め込み、`.git/config` には一切書き込まない
+#   （`persist-credentials: false` + push時のみ `x-access-token:` 形式のURL）。
 on:
   issues:
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        required: true
+        type: number
 
 permissions:
   contents: write
@@ -29,25 +48,47 @@ permissions:
   issues: write
 
 concurrency:
-  group: ai-branch-ai/issue-${{ github.event.issue.number }}
+  group: ai-branch-ai/issue-${{ inputs.issue_number || github.event.issue.number }}
 
 jobs:
   ai-edit:
-    if: github.event.label.name == 'package-request' && vars.AI_PIPELINE_ENABLED == 'true'
+    if: (github.event_name == 'workflow_dispatch' || github.event.label.name == 'package-request') && vars.AI_PIPELINE_ENABLED == 'true' && vars.AI_AGENT_LOOP_HANDLER == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BRANCH: ai/issue-${{ github.event.issue.number }}
-      ISSUE_NUMBER: ${{ github.event.issue.number }}
-      ISSUE_TITLE: ${{ github.event.issue.title }}
-      ISSUE_BODY: ${{ github.event.issue.body }}
+      BRANCH: ai/issue-${{ inputs.issue_number || github.event.issue.number }}
+      ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
+      - name: issue_number の検証（不正な値ならチェックアウト前にジョブを失敗させる）
+        run: |
+          if ! [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::issue_number が不正です: $ISSUE_NUMBER"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
 
       - name: 作業ブランチをmainから作成（既存でも強制的にリセット）
         run: git checkout -B "$BRANCH"
+
+      - name: "Issueのタイトル・本文を取得（issues:labeled: イベントペイロードから$RUNNER_TEMPへ書き出し）"
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          printf '%s' "$ISSUE_TITLE" > "$RUNNER_TEMP/issue_title.txt"
+          printf '%s' "$ISSUE_BODY" > "$RUNNER_TEMP/issue_body.txt"
+
+      - name: "Issueのタイトル・本文を取得（workflow_dispatch: GitHub APIから取得し$RUNNER_TEMPへ書き出し）"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.title' > "$RUNNER_TEMP/issue_title.txt"
+          gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.body // ""' > "$RUNNER_TEMP/issue_body.txt"
 
       - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
         run: echo '_trusted/' >> .git/info/exclude
@@ -58,161 +99,76 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
 
-      - name: OpenRouter (GLM 5.3) にNixコード生成を依頼し、許可パスへ書き込む
+      - name: niriをインストール（flake.lockのピンを使用。--inputs-from . 必須）
+        timeout-minutes: 5
+        run: nix profile install --inputs-from . nixpkgs#niri
+
+      - name: credentialが.git/configに残っていないことを確認（push前の事前チェック）
+        run: |
+          if git config --get-regexp '^http\..*extraheader' >/dev/null 2>&1; then
+            echo "::error::credential leak detected: http.*.extraheader is set in .git/config"
+            exit 1
+          else
+            echo "(no extraheader — OK)"
+          fi
+          origin_url="$(git config --get remote.origin.url)"
+          case "$origin_url" in
+            *x-access-token:*|*@*)
+              echo "::error::credential leak detected: remote.origin.url contains an embedded token: $origin_url"
+              exit 1
+              ;;
+            *)
+              echo "remote.origin.url: $origin_url (no embedded token — OK)"
+              ;;
+          esac
+
+      - name: GLMエージェントループを実行し、許可パスへ書き込む
         run: |
           python3 <<'PYEOF'
-          import json
           import os
-          import re
           import sys
-          import urllib.request
 
           sys.path.insert(0, "_trusted/.github/scripts")
           import ai_pipeline  # noqa: E402
+          import glm_agent  # noqa: E402
 
-          def read_if_exists(path):
-              try:
-                  return open(path, encoding="utf-8").read()
-              except FileNotFoundError:
-                  return "(does not exist)"
-
-          # 読み取り専用コンテキスト：AIはこれらを読んで既存の構造・命名規則
-          # （ユーザー名 fse、ホスト名 t480s 等）を把握するが、これらのファイル自体は
-          # 出力対象に含められない（許可リストに入っていないため）。
-          context = {
-              "hosts/t480s/configuration.nix": read_if_exists("hosts/t480s/configuration.nix"),
-              "modules/packages.nix": read_if_exists("modules/packages.nix"),
-              "modules/shell.nix": read_if_exists("modules/shell.nix"),
-              "modules/desktop.nix": read_if_exists("modules/desktop.nix"),
-              "home/fse.nix": read_if_exists("home/fse.nix"),
-          }
-          context_block = "\n\n".join(
-              f"--- {path}（読み取り専用、編集不可） ---\n{content}"
-              for path, content in context.items()
-          )
-
-          issue_title = ai_pipeline.sanitize_text(os.environ.get("ISSUE_TITLE", ""), max_len=300)
-          issue_body = ai_pipeline.sanitize_text(os.environ.get("ISSUE_BODY", ""), max_len=4000)
+          runner_temp = os.environ["RUNNER_TEMP"]
           issue_number = os.environ["ISSUE_NUMBER"]
-          api_key = os.environ["OPENROUTER_API_KEY"]
 
-          prompt = f"""あなたはNixOS設定リポジトリに変更を加えるアシスタントです。
-          このリポジトリでは、あなたが書き込めるファイルパスは以下の3つのディレクトリの
-          直下（サブディレクトリ禁止）に限定されています：
-            modules/ai/<name>.<nix|kdl|toml|json|conf>
-            home/ai/<name>.<nix|kdl|toml|json|conf>
-            tests/ai/<name>.<nix|kdl|toml|json|conf>
-          <name>は英数字・アンダースコア・ハイフンのみ。ファイル名は "default.nix" 禁止。
-          これ以外のパス（hosts/**, flake.nix, .github/**, secrets/** を含む）には
-          一切書き込めません。
+          with open(os.path.join(runner_temp, "issue_title.txt"), encoding="utf-8") as f:
+              issue_title = ai_pipeline.sanitize_text(f.read(), max_len=300)
+          with open(os.path.join(runner_temp, "issue_body.txt"), encoding="utf-8") as f:
+              issue_body = ai_pipeline.sanitize_text(f.read(), max_len=4000)
 
-          modules/ai/*.nix は NixOSモジュールとして自動importされます
-          （`{{ pkgs, ... }}: {{ ... }}` の形の関数を返してください）。
-          home/ai/*.nix は Home Manager モジュールとして自動importされます。
-          .kdl/.toml/.json/.conf ファイルは、同じディレクトリに置いた .nix ファイルから
-          `home.file` 等で参照する設定ファイル本体として使えます。
-
-          {context_block}
+          initial_message = f"""issue #{issue_number} の内容に対応してください。
 
           --- issue #{issue_number} タイトル ---
           {issue_title}
 
           --- issue #{issue_number} 本文 ---
           {issue_body}
-
-          出力は以下のスキーマのJSONオブジェクト1つのみとしてください。説明文・
-          コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと：
-          {{
-            "files": {{ "<許可パス>": "<ファイルの完全な内容>", ... }},
-            "title": "<変更内容を要約したPRタイトル（日本語可、60文字程度）>",
-            "summary": "<何をどう変えたかの要約。箇条書き推奨>"
-          }}
-          issueの内容から具体的な変更が読み取れない場合は、"files" を空オブジェクトに
-          してください（その場合このワークフローは変更なしとして中断します）。
           """
 
-          req = urllib.request.Request(
-              "https://openrouter.ai/api/v1/chat/completions",
-              data=json.dumps({
-                  "model": "z-ai/glm-5.3",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0,
-              }).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
+          result = glm_agent.run_agent_loop(initial_message, commit_trailer=None)
+          if result["aborted"]:
+              sys.exit(1)
+
+          with open(os.path.join(runner_temp, "commit_msg.txt"), encoding="utf-8") as f:
+              base_commit_msg = f.read()
+          final_commit_msg = (
+              f"{base_commit_msg}\n"
+              "AI-generated (OpenRouter GLM 5.3), needs review.\n"
+              f"Refs #{issue_number}\n"
           )
-
-          with urllib.request.urlopen(req, timeout=120) as resp:
-              response = json.load(resp)
-
-          raw = response["choices"][0]["message"]["content"].strip()
-          print(f"AI raw response: {raw}")
-
-          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
-          if fence_match:
-              raw = fence_match.group(1).strip()
-
-          try:
-              result = json.loads(raw)
-          except json.JSONDecodeError:
-              print(f"::error::AIの応答がJSONとして解釈できません: {raw!r}")
-              sys.exit(1)
-
-          if not isinstance(result, dict) or "files" not in result:
-              print("::error::AIの応答に'files'キーがありません。中断します。")
-              sys.exit(1)
-
-          files = result["files"]
-          title = str(result.get("title") or f"ai: address #{issue_number}")[:100]
-          summary = str(result.get("summary") or "(要約なし)")[:2000]
-
-          if not isinstance(files, dict) or not files:
-              print("::error::filesが空です。issueから具体的な変更を読み取れなかった可能性があります。中断します。")
-              sys.exit(1)
-
-          violations = ai_pipeline.validate_paths(list(files.keys()))
-          if violations:
-              print(f"::error::許可リスト外のパスが含まれています: {violations}。中断します。")
-              sys.exit(1)
-
-          for path, content in files.items():
-              if not isinstance(content, str):
-                  print(f"::error::{path} の内容が文字列ではありません。中断します。")
-                  sys.exit(1)
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(content)
-              print(f"wrote {path} ({len(content)} bytes)")
-
-          runner_temp = os.environ["RUNNER_TEMP"]
-          with open(os.path.join(runner_temp, "expected_files.txt"), "w", encoding="utf-8") as f:
-              f.write("\n".join(sorted(files.keys())))
-          with open(os.path.join(runner_temp, "pr_title.txt"), "w", encoding="utf-8") as f:
-              f.write(title)
-          with open(os.path.join(runner_temp, "pr_summary.txt"), "w", encoding="utf-8") as f:
-              f.write(summary)
-          with open(os.path.join(runner_temp, "commit_msg.txt"), "w", encoding="utf-8") as f:
-              f.write(f"{title}\n\n{summary}\n\nAI-generated (OpenRouter GLM 5.3), needs review.\nRefs #{issue_number}\n")
+          with open(os.path.join(runner_temp, "commit_msg_final.txt"), "w", encoding="utf-8") as f:
+              f.write(final_commit_msg)
           PYEOF
 
-      - name: 変更が許可リスト・AI申告パスと完全一致することを検証
+      - name: 変更差分を検証（許可パスの最終再確認、A/Mパスのみ後続の検証ステップへ渡す）
         run: |
           git add -A
-          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged_files.txt"
-          sort "$RUNNER_TEMP/expected_files.txt" > "$RUNNER_TEMP/expected_files_sorted.txt"
-          if [ ! -s "$RUNNER_TEMP/staged_files.txt" ]; then
-            echo "::error::変更がありませんでした。中断します。"
-            exit 1
-          fi
-          if ! diff -q "$RUNNER_TEMP/staged_files.txt" "$RUNNER_TEMP/expected_files_sorted.txt" > /dev/null; then
-            echo "::error::実際に変更されたファイルがAI申告分と一致しません。"
-            echo "staged:"; cat "$RUNNER_TEMP/staged_files.txt"
-            echo "expected:"; cat "$RUNNER_TEMP/expected_files_sorted.txt"
-            exit 1
-          fi
+          git diff --cached --no-renames -z --name-status | \
+            python3 _trusted/.github/scripts/ai_pipeline.py check-diff > "$RUNNER_TEMP/changed_files.txt"
 
       - name: Nix構文チェック（括弧バランス等。ビルド検証自体はcheck-light.ymlに委ねる）
         run: |
@@ -223,7 +179,7 @@ jobs:
                 nix-instantiate --parse "$f" > /dev/null
                 ;;
             esac
-          done < "$RUNNER_TEMP/staged_files.txt"
+          done < "$RUNNER_TEMP/changed_files.txt"
 
       - name: 危険な構文のアドバイザリスキャン（ブロックはしない、ラベル付けのみ）
         run: |
@@ -236,11 +192,11 @@ jobs:
           import ai_pipeline  # noqa: E402
 
           runner_temp = os.environ["RUNNER_TEMP"]
-          with open(os.path.join(runner_temp, "staged_files.txt"), encoding="utf-8") as f:
-              staged = [line.strip() for line in f if line.strip()]
+          with open(os.path.join(runner_temp, "changed_files.txt"), encoding="utf-8") as f:
+              changed = [line.strip() for line in f if line.strip()]
 
           all_hits = set()
-          for path in staged:
+          for path in changed:
               with open(path, encoding="utf-8") as f:
                   all_hits.update(ai_pipeline.scan_dangerous_content(f.read()))
 
@@ -254,8 +210,8 @@ jobs:
         run: |
           git config user.name "ai-issue-handler[bot]"
           git config user.email "ai-issue-handler@users.noreply.github.com"
-          git commit -F "$RUNNER_TEMP/commit_msg.txt"
-          git push --force origin "HEAD:$BRANCH"
+          git commit -F "$RUNNER_TEMP/commit_msg_final.txt"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "HEAD:$BRANCH"
 
       - name: PRを作成（既存なら本文・タイトルを更新）
         run: |
