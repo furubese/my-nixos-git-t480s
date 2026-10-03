@@ -87,19 +87,19 @@ class RunCommandAllowListTests(unittest.TestCase):
                 with self.assertRaises(glm_agent.ToolDenied):
                     self.session.run_command(argv)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_allows_niri_validate(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
         result = self.session.run_command(["niri", "validate", "-c", "home/ai/niri.kdl"])
         self.assertIn("exit_code=0", result)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_allows_nix_instantiate_parse(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         result = self.session.run_command(["nix-instantiate", "--parse", "modules/ai/foo.nix"])
         self.assertIn("exit_code=0", result)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_env_excludes_secret_like_names(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "x", "SOME_TOKEN": "y"}):
