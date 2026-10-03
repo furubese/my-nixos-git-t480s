@@ -136,6 +136,79 @@ def scan_dangerous_content(text: str):
     return sorted(hits)
 
 
+# --- diff parsing (final allow-list re-check) --------------------------------
+#
+# Replaces the old "AI-declared file list == staged diff" comparison. The
+# agent loop (glm_agent.py) already enforces is_allowed_path() at write/delete
+# time, but this is the last line of defense: it re-derives the actual
+# changed paths from git itself and re-checks every one of them. Callers must
+# invoke `git diff` with `--no-renames` (a rename collapses a write+delete
+# pair into a single `Rxxx\0old\0new\0` record, which would otherwise hide
+# the write's destination path from a naive 2-field parser). This parser
+# still understands the 3-field rename/copy form so that if a caller forgets
+# `--no-renames`, the violation is caught here instead of silently bypassing
+# the check.
+
+_RENAME_OR_COPY_STATUS_RE = re.compile(r"^[RC]")
+
+
+def parse_diff_name_status(output: str):
+    """Parse `git diff --name-status -z` output into (status, paths) tuples.
+
+    `paths` is a 1-tuple for ordinary A/M/D records and a 2-tuple
+    `(old_path, new_path)` for R/C (rename/copy) records, which carry an
+    extra path field even under `-z`.
+    """
+    fields = output.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()  # trailing NUL produces an empty final field
+    entries = []
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        i += 1
+        if _RENAME_OR_COPY_STATUS_RE.match(status):
+            if i + 1 >= len(fields):
+                raise ValueError(
+                    f"truncated name-status record: status {status!r} is missing its old/new path pair"
+                )
+            old_path, new_path = fields[i], fields[i + 1]
+            i += 2
+            entries.append((status, (old_path, new_path)))
+        else:
+            if i >= len(fields):
+                raise ValueError(f"truncated name-status record: status {status!r} is missing its path")
+            path = fields[i]
+            i += 1
+            entries.append((status, (path,)))
+    return entries
+
+
+def filter_allowed_paths(entries):
+    """Return every path across all diff `entries` that fails is_allowed_path().
+
+    Checks all paths of every record (both old and new path for a
+    rename/copy record), so a disallowed destination can never hide behind
+    an allowed source path or vice versa.
+    """
+    return [
+        path
+        for _status, paths in entries
+        for path in paths
+        if not is_allowed_path(path)
+    ]
+
+
+def changed_paths_by_status(entries, statuses):
+    """Return the single path of each non-rename `entries` record whose status
+    starts with one of `statuses` (e.g. `("A", "M")` to exclude deletions)."""
+    return [
+        paths[0]
+        for status, paths in entries
+        if len(paths) == 1 and status[:1] in statuses
+    ]
+
+
 # --- gh-backed dispatch-input validation (used by ai-issue-autofix.yml) -----
 
 
@@ -245,6 +318,15 @@ def main():
     p_dispatch.add_argument("--branch", required=True)
     p_dispatch.add_argument("--run-id", required=True)
 
+    sub.add_parser(
+        "check-diff",
+        help=(
+            "Read `git diff --cached --no-renames -z --name-status` from stdin, "
+            "re-validate every changed path against the allow-list, and print "
+            "the added/modified paths (one per line) for downstream checks"
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.command == "check-paths":
@@ -261,6 +343,30 @@ def main():
 
     elif args.command == "validate-dispatch":
         validate_dispatch(args.branch, args.run_id)
+
+    elif args.command == "check-diff":
+        try:
+            entries = parse_diff_name_status(sys.stdin.read())
+        except ValueError as error:
+            print(f"::error::malformed diff input: {error}", file=sys.stderr)
+            sys.exit(1)
+        if not entries:
+            print("::error::変更がありませんでした。中断します。", file=sys.stderr)
+            sys.exit(1)
+        renames = [(status, paths) for status, paths in entries if len(paths) == 2]
+        if renames:
+            print(
+                f"::error::rename/copy records present — caller must pass --no-renames (got {renames})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        violations = filter_allowed_paths(entries)
+        if violations:
+            print(f"::error::paths outside the AI edit scope: {violations}", file=sys.stderr)
+            sys.exit(1)
+        print(f"check-diff OK: {len(entries)} entrie(s) validated", file=sys.stderr)
+        for path in changed_paths_by_status(entries, ("A", "M")):
+            print(path)
 
 
 if __name__ == "__main__":

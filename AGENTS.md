@@ -61,36 +61,102 @@ material for a written article about building it — see "Article log" below).
   currently an unimported stub, so a `pull_request` trigger on it would be a guaranteed-red
   check on a public repo. Only add a `pull_request` trigger back once `modules/desktop.nix`
   is a real, working module that's actually imported.
-- **AI pipeline overview (v2, free-form Nix generation)**: three workflows —
-  `ai-issue-handler.yml`, `ai-issue-autofix.yml`, `ai-issue-feedback.yml` — share one design.
-  The AI (OpenRouter, `z-ai/glm-5.3`, not the Claude Code CLI — deliberate, don't "helpfully"
-  switch it back) is allowed to generate real Nix code, but only as a JSON object
-  `{"files": {"<path>": "<full content>", ...}, "title": "...", "summary": "..."}` whose keys
-  must all pass `.github/scripts/ai_pipeline.py`'s path allow-list
-  (`modules/ai/**`, `home/ai/**`, `tests/ai/**`, direct children only, never `default.nix`).
-  That script is always checked out from `main` (`path: _trusted`) — an AI-controlled branch
-  can never rewrite the rules that constrain it. After writing files, every workflow: (1) runs
-  `git add -A` then diffs `git diff --cached --name-only` against the AI's own declared file
-  list and fails closed on any mismatch (`git diff --name-only` alone misses new/untracked
-  files — a real bug from an earlier draft); (2) runs `nix-instantiate --parse` on every
-  changed `.nix` file (syntax only — real build verification is `check-light.yml`'s job, not
-  duplicated here); (3) runs an **advisory-only** content scan for dangerous constructs
-  (`hashedPassword`, `systemd.services`, `lib.mkForce`, etc.) that never blocks a PR, only adds
-  a `needs-careful-review` label (regex scanning is trivially bypassed by nesting attrsets, so
-  it can't be a real gate — human full-diff review before merge is the actual defense). All
-  three workflows are gated on the `vars.AI_PIPELINE_ENABLED` repo variable
-  (`gh variable set AI_PIPELINE_ENABLED --body true` to turn the pipeline on — unset means
-  fail-closed) and share one GitButler-style concurrency key per issue,
-  `ai-branch-ai/issue-N`, so the three workflows never race each other on the same branch.
-- `.github/workflows/ai-issue-handler.yml` runs on `issues: labeled` and is gated on the
-  `package-request` label (adding a label requires triage/write repo access, which is what
-  keeps a public repo's issue tracker from being an open trigger). It force-resets
-  `ai/issue-N` from `main` every run, writes the AI's declared files, and opens (or updates) a
-  PR with an AI-generated title/summary instead of the old fixed `packages: address #N` title.
-  Issue title/body are untrusted input, sanitized via `ai_pipeline.sanitize_text` (strips HTML
-  comments, including unclosed ones — a plausible prompt-injection vector) and passed via
-  `env:`, never interpolated directly into a `run:` shell block.
-- `.github/workflows/ai-issue-autofix.yml` is dispatched directly by `check-light.yml`'s
+- **AI pipeline overview (v3, agentic list/read/write/delete/run)**: three workflows —
+  `ai-issue-handler.yml`, `ai-issue-autofix.yml`, `ai-issue-feedback.yml` — share one loop,
+  `.github/scripts/glm_agent.py`'s `run_agent_loop()`. The AI (OpenRouter, `z-ai/glm-5.3`, not
+  the Claude Code CLI — deliberate, don't "helpfully" switch it back) is no longer asked to
+  return one JSON blob of files; it drives a multi-turn tool-calling loop with six tools —
+  `list_dir`, `read_file`, `write_file`, `delete_file`, `run_command`, `submit` — and decides
+  for itself when it's done. **Why agentic, not static context injection**: the v2 design fed
+  `ai-issue-handler.yml` a fixed set of 5 files as its only context, so it never saw what
+  already existed under `modules/ai/**`/`home/ai/**`/`tests/ai/**` — while `autofix`/`feedback`
+  separately `glob.glob`'d those same directories and did see it. That asymmetry (a Deep
+  Interview finding during the v3 redesign) meant the handler could silently duplicate or
+  conflict with files an earlier run had already written. `list_dir`/`read_file` fix that by
+  letting every workflow inspect current directory state before writing; `write_file`/
+  `delete_file` let the model clean up its own earlier output instead of only ever accreting
+  files; `run_command` lets it self-validate (`niri validate`, `nix-instantiate --parse`)
+  before calling `submit`, instead of finding out only from `check-light.yml` after the push.
+  `glm_agent.py` is, like `.github/scripts/ai_pipeline.py`, always checked out from `main`
+  (`path: _trusted`, or `$RUNNER_TEMP/trusted` for `autofix` — see below) — an AI-controlled
+  branch can never rewrite the rules that constrain it, including its own copy of the agent
+  loop. **This is still not a capability sandbox**: inside the allow-listed paths the model can
+  write arbitrary NixOS options, same as v2; only the allow-list enforcement moved from
+  "validate a JSON key list" to "validate at `write_file`/`delete_file` time, then re-validate
+  the actual git diff afterwards" (see below). The real defense is unchanged: a human reads the
+  whole diff before merge.
+- **`run_command` allow-list (prefix-based `argv[0]` + a fixed deny-list, `glm_agent.py:38-41`)**:
+  `argv[0]` must be `nix`, `niri`, or `nix-instantiate`; within that, `nix run`/`build`/
+  `develop`/`shell` and `nix flake check` are refused as subcommands, and `--impure`, `-I`,
+  `--option`, `--arg`, `--argstr` are refused anywhere in `argv` (`glm_agent.py:318-337`). This
+  is a deliberate reversion to the spec's original prefix-based design — an exact-argv-match
+  alternative was drafted during consensus review to close the RCE surface (prefix matching
+  lets a future unlisted `nix`/`niri` subcommand or flag combination through until someone adds
+  it to the deny-list) and was then explicitly rejected by the user in favor of prefix-based
+  matching with this deny-list as the mitigation. That residual risk is accepted, not
+  overlooked. `run_command`'s environment is a **deny-list, not an allow-list**
+  (`glm_agent.py:43-47,217-222`): names matching `(?i)(TOKEN|KEY|SECRET|PASSWORD|_API_)` are
+  stripped, plus `OPENROUTER_API_KEY`/`GH_TOKEN`/`GITHUB_TOKEN` are always stripped by exact
+  name regardless of pattern match, so `PATH`/`HOME`/etc. still reach `nix` without needing an
+  explicit allow-list (an allow-list approach was tried first and broke `nix-instantiate`).
+  `niri` itself is installed in a dedicated pre-loop step (`nix profile install --inputs-from .
+  nixpkgs#niri`, pinned to `flake.lock`), never through `run_command` — a cold `nix run
+  nixpkgs#niri` is a ~760MiB fetch that would blow the loop's per-command timeout.
+- **Diff-based final allow-list re-check (replaces the old JSON-declared-file-list check)**:
+  after the loop exits, every workflow runs `git add -A; git diff --cached --no-renames -z
+  --name-status`, feeds it to `ai_pipeline.py check-diff`, and aborts if any changed path (A,
+  M, or D) fails `is_allowed_path()` — independent of whatever `write_file`/`delete_file` already
+  enforced during the loop. `--no-renames` is required: without it a `write_file` + `delete_file`
+  pair of the same content can collapse into a single rename record, which would otherwise hide
+  the new path from a status/path parser expecting one path per record (`ai_pipeline.py:139-203`
+  handles both forms, so a caller that forgets `--no-renames` still gets caught here instead of
+  silently bypassing the check). `nix-instantiate --parse` then runs only over the check-diff
+  command's A/M output — D (deleted) paths obviously can't be parsed.
+- **Staged rollout (Option C)**: three independent repo variables, `vars.AI_AGENT_LOOP_AUTOFIX`
+  / `_HANDLER` / `_FEEDBACK` (all default unset/false, same fail-closed convention as
+  `AI_PIPELINE_ENABLED`), each **AND**ed with the existing `vars.AI_PIPELINE_ENABLED` master
+  switch rather than replacing it. Enabled in sequence: autofix → handler → feedback. **Honest
+  limitation**: because `glm_agent.py` is always loaded from `_trusted` (= `main`), a PR that
+  changes `glm_agent.py` can never exercise its own change through its own workflow run — only
+  after that PR merges does any workflow actually execute the new agent-loop code. Staged
+  rollout therefore does not buy pre-merge verification; what it buys is spreading production
+  activation across time, with an operational safety valve of not raising the next flag if the
+  current stage misbehaves. It is also not possible to enable autofix as "manual canary only":
+  `check-light.yml`'s `dispatch-autofix` job only checks `AI_PIPELINE_ENABLED` (unchanged by
+  this redesign), so flipping `AI_AGENT_LOOP_AUTOFIX` to `true` simultaneously enables manual
+  `workflow_dispatch` testing and automatic dispatch from real CI failures.
+- **Push credentials**: every AI workflow checks out its working branch with
+  `persist-credentials: false` and pushes with the token embedded only in the push URL argument
+  (`https://x-access-token:${GH_TOKEN}@github.com/...`, never via `git remote set-url`), so a
+  token is never written to `.git/config`. Each workflow verifies this with a pre-loop check
+  (`git config --get-regexp '^http\..*extraheader'` plus eyeballing `remote.origin.url` for an
+  embedded token) before the agent loop ever runs. `ai-issue-handler.yml` pushes with `--force`
+  (it always does `git checkout -B "$BRANCH"` from `main`, so every run, including a second
+  labeling of the same issue, needs a non-fast-forward push); `ai-issue-autofix.yml` and
+  `ai-issue-feedback.yml` push without `--force` (they commit on top of the existing PR branch).
+  This asymmetry is unchanged from before the agentic redesign — only the push mechanism
+  (URL-argument token vs. whatever came before) changed, not which workflow forces.
+- `.github/workflows/ai-issue-handler.yml` runs on `issues: labeled` (gated on the
+  `package-request` label — adding a label requires triage/write repo access, which is what
+  keeps a public repo's issue tracker from being an open trigger) **or** `workflow_dispatch`
+  with a required `issue_number` input, validated against `^[1-9][0-9]*$` in the first step
+  (before checkout) since `type: number` is only a UI hint and any string can reach the job via
+  the REST API. The job condition ANDs the existing `vars.AI_PIPELINE_ENABLED` with the new
+  `vars.AI_AGENT_LOOP_HANDLER` (both default false). It force-resets `ai/issue-N` from `main`
+  every run via `git checkout -B`, hands the issue title/body to `glm_agent.run_agent_loop()`,
+  and opens (or updates) a PR with an AI-generated title/summary instead of the old fixed
+  `packages: address #N` title. Issue title/body are untrusted input: for the `labeled` event
+  they arrive via step-level `env:` and are written to `$RUNNER_TEMP/issue_{title,body}.txt`
+  with `printf`, never interpolated directly into a `run:` shell block; for `workflow_dispatch`
+  they're fetched via `gh api repos/.../issues/$ISSUE_NUMBER` and redirected straight to the
+  same two files. Either way, the Python step reads those files and runs them through
+  `ai_pipeline.sanitize_text` (strips HTML comments, including unclosed ones — a plausible
+  prompt-injection vector) before they ever reach the model.
+- `.github/workflows/ai-issue-autofix.yml`'s job condition ANDs `vars.AI_PIPELINE_ENABLED`
+  with `vars.AI_AGENT_LOOP_AUTOFIX` (default false); the CI failure log is handed to the same
+  `glm_agent.run_agent_loop()` the other two workflows use, with `commit_trailer="AI-Autofix-Attempt:
+  true"` so the trailer contract below is expressed as a loop parameter rather than hand-built
+  per workflow. It is dispatched directly by `check-light.yml`'s
   `dispatch-autofix` job on its own build failure (`workflow_dispatch` with `branch`/`run_id`
   inputs) — **not** a `workflow_run` chain. An earlier draft relied on `workflow_run`, and a
   Critic review during the redesign found it empirically never fired (0-for-4 in real runs)
@@ -115,10 +181,17 @@ material for a written article about building it — see "Article log" below).
   after the cap is hit and would otherwise repost the same comment endlessly.
 - `.github/workflows/ai-issue-feedback.yml` reacts to `issue_comment` on a PR, but only when
   the commenter is `github.repository_owner` and the `resolve` job confirms the PR is a
-  same-repo, bot-authored `ai/issue-N` PR. After pushing a fix commit, it does **not** post a
-  reply comment — that was an explicit Deep Interview decision (Round 10) — with one
-  consented exception: if the advisory content scan flags something, it both labels and
-  comments on the PR to make sure the extra-review signal isn't silently missed.
+  same-repo, bot-authored `ai/issue-N` PR. The `resolve` job's condition ANDs the existing
+  `vars.AI_PIPELINE_ENABLED` with the new `vars.AI_AGENT_LOOP_FEEDBACK` (default false) — put
+  on `resolve`, not the `feedback` job, since that's where the master switch already lived.
+  The comment body is sanitized (`ai_pipeline.sanitize_text`, `max_len=2000`, same cap as
+  before) and handed to `glm_agent.run_agent_loop()` with **`commit_trailer=None`** —
+  deliberately no trailer, since that absence is exactly what the autofix attempt-streak reset
+  above depends on; passing a trailer here would silently defeat that mechanism. After pushing
+  a fix commit, it does **not** post a reply comment — that was an explicit Deep Interview
+  decision (Round 10) — with one consented exception: if the advisory content scan flags
+  something, it both labels and comments on the PR to make sure the extra-review signal isn't
+  silently missed.
 - All three AI workflows dispatch `check-light.yml` (`gh workflow run check-light.yml --ref
   <branch>`) after pushing, rather than relying on it auto-triggering on the push: a PR's
   *first* workflow run under `GITHUB_TOKEN` authorship requires manual "Approve and run" in the

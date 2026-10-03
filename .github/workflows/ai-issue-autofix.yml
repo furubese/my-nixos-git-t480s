@@ -11,10 +11,14 @@ name: AI Issue Autofix
 # - _trusted は先にcheckoutして検証に使うため、後続のブランチcheckout（pathなし＝
 #   ワークスペースルート）によって削除される。削除される前に $RUNNER_TEMP へ退避する
 #   （v5.2で修正：以前はここで_trustedが消えて以降の全ステップが失敗する設計ミスがあった）。
-# - AIの書き込み対象・検証方法は ai-issue-handler.yml と同一（modules/ai/**, home/ai/**,
+# - AIへの問い合わせ・許可パスへの読み書き・run_commandによる検証は、3ワークフロー共通の
+#   共有エージェントループ（_trusted/.github/scripts/glm_agent.py の run_agent_loop）に
+#   委譲する。書き込み対象・検証方法は ai-issue-handler.yml と同一（modules/ai/**, home/ai/**,
 #   tests/ai/** への path allow-list、構文チェックのみ、advisory contentスキャン）。
 # - 修正コミットには "AI-Autofix-Attempt: true" というトレーラーを必ず付け、試行回数は
 #   このトレーラーを持つコミット数（origin/main..HEAD）で数える。外部の状態ストアは使わない。
+# - このジョブは vars.AI_PIPELINE_ENABLED（既存マスタースイッチ）に加え、
+#   vars.AI_AGENT_LOOP_AUTOFIX が 'true' の場合のみ動く（ANDで追加、段階的ロールアウト用）。
 on:
   workflow_dispatch:
     inputs:
@@ -36,8 +40,9 @@ concurrency:
 
 jobs:
   autofix:
-    if: vars.AI_PIPELINE_ENABLED == 'true'
+    if: vars.AI_PIPELINE_ENABLED == 'true' && vars.AI_AGENT_LOOP_AUTOFIX == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -59,10 +64,31 @@ jobs:
 
       - name: 対象ブランチをcheckout
         uses: actions/checkout@v4
-        with: { ref: "${{ inputs.branch }}", fetch-depth: 0 }
+        with: { ref: "${{ inputs.branch }}", fetch-depth: 0, persist-credentials: false }
         # 注意：このcheckoutはpath未指定＝ワークスペースルートが対象。actions/checkoutは
         # 対象ディレクトリに一致する.gitが無い場合中身を削除するため、直前に作成した
         # _trusted/ もここで消える。だからこそ上のステップで$RUNNER_TEMPへ退避している。
+        # persist-credentials: false により .git/config にトークンを残さない（pushは
+        # 専用ステップでURL引数としてのみ渡す。下の確認ステップ参照）。
+
+      - name: push用クレデンシャルが.git/configに残っていないことを確認
+        run: |
+          if git config --get-regexp '^http\..*extraheader' >/dev/null 2>&1; then
+            echo "::error::credential leak detected: http.*.extraheader is set in .git/config"
+            exit 1
+          else
+            echo "(no extraheader — OK)"
+          fi
+          remote_url=$(git config --get remote.origin.url)
+          case "$remote_url" in
+            *x-access-token:*|*@*)
+              echo "::error::remote.origin.url にトークン埋め込みの痕跡があります: $remote_url"
+              exit 1
+              ;;
+            *)
+              echo "remote.origin.url OK: $remote_url"
+              ;;
+          esac
 
       - name: 試行回数を確認（直近の人間の介入＝feedbackコミット以降の連続試行回数のみ数える）
         id: attempts
@@ -143,135 +169,58 @@ jobs:
       - uses: cachix/install-nix-action@v27
         if: steps.attempts.outputs.exhausted == 'false'
 
-      - name: OpenRouter (GLM 5.3) に修正を依頼し、許可パスへ書き込む
+      - name: niriをインストール（run_commandのコールドラン回避。flake.lockのピンを使うため--inputs-from .必須）
+        if: steps.attempts.outputs.exhausted == 'false'
+        timeout-minutes: 5
+        run: nix profile install --inputs-from . nixpkgs#niri
+
+      - name: OpenRouter (GLM 5.3) エージェントループで修正・検証・書き込みを行う
         if: steps.attempts.outputs.exhausted == 'false'
         run: |
           python3 <<'PYEOF'
-          import glob
-          import json
           import os
-          import re
           import sys
-          import urllib.request
 
           sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "trusted", ".github", "scripts"))
           import ai_pipeline  # noqa: E402
+          import glm_agent  # noqa: E402
 
           runner_temp = os.environ["RUNNER_TEMP"]
-          failure_log = open(os.path.join(runner_temp, "failure_log_tail.txt"), encoding="utf-8", errors="replace").read()
-          api_key = os.environ["OPENROUTER_API_KEY"]
+          with open(os.path.join(runner_temp, "failure_log_tail.txt"), encoding="utf-8", errors="replace") as f:
+              raw_failure_log = f.read()
+          # CI失敗ログは信頼できない入力として扱う（ビルドされたコード自身がログに
+          # 任意の文字列を出力できる）。run_agent_loopに渡す前にsanitize_textを通す。
+          failure_log = ai_pipeline.sanitize_text(raw_failure_log, max_len=20000)
 
-          ai_files = {}
-          for pattern in ("modules/ai/*", "home/ai/*", "tests/ai/*"):
-              for path in glob.glob(pattern):
-                  if os.path.isfile(path) and os.path.basename(path) != "default.nix":
-                      ai_files[path] = open(path, encoding="utf-8").read()
-          current_block = "\n\n".join(
-              f"--- {path} ---\n{content}" for path, content in ai_files.items()
-          ) or "(no AI-managed files currently exist)"
+          initial_message = f"""以下はこのリポジトリのCI失敗ログです。list_dir / read_file で
+          modules/ai/, home/ai/, tests/ai/ 配下の既存ファイルを確認し、失敗原因を修正してください。
 
-          prompt = f"""あなたはNixOS設定リポジトリのCI失敗を修正するアシスタントです。
-          以下は、あなたが以前に生成した modules/ai/**, home/ai/**, tests/ai/** 配下の
-          ファイル（AIが書き込める範囲はこの3ディレクトリの直下のみ、ネスト禁止）と、
-          それをビルドしたCIの失敗ログです。
-
-          {current_block}
-
-          --- CI失敗ログ（末尾200行） ---
+          --- CI失敗ログ（末尾200行、サニタイズ済み） ---
           {failure_log}
-
-          失敗原因を修正した「変更後の完全なファイル内容」を、変更が必要なファイルについてのみ
-          出力してください（変更不要なファイルは含めない）。新しいファイルを追加して修正しても
-          構いませんが、パスは modules/ai/**, home/ai/**, tests/ai/** の直下のみです。
-          失敗原因が読み取れない場合は、最も疑わしい変更点を1つ取り除く形で修正してください。
-
-          出力は以下のスキーマのJSONオブジェクト1つのみとしてください。説明文・
-          コードブロック・マークダウンのフェンス・前置き・後書きは一切含めないこと：
-          {{
-            "files": {{ "<許可パス>": "<ファイルの完全な内容>", ... }},
-            "title": "<修正内容を要約した短い説明（日本語可）>",
-            "summary": "<何をどう修正したかの要約>"
-          }}
           """
 
-          req = urllib.request.Request(
-              "https://openrouter.ai/api/v1/chat/completions",
-              data=json.dumps({
-                  "model": "z-ai/glm-5.3",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0,
-              }).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
+          result = glm_agent.run_agent_loop(
+              initial_message,
+              commit_trailer="AI-Autofix-Attempt: true",
           )
-
-          with urllib.request.urlopen(req, timeout=120) as resp:
-              response = json.load(resp)
-
-          raw = response["choices"][0]["message"]["content"].strip()
-          print(f"AI raw response: {raw}")
-
-          fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
-          if fence_match:
-              raw = fence_match.group(1).strip()
-
-          try:
-              result = json.loads(raw)
-          except json.JSONDecodeError:
-              print(f"::error::AIの応答がJSONとして解釈できません: {raw!r}")
+          if result["aborted"]:
               sys.exit(1)
 
-          if not isinstance(result, dict) or "files" not in result:
-              print("::error::AIの応答に'files'キーがありません。中断します。")
-              sys.exit(1)
-
-          files = result["files"]
-          title = str(result.get("title") or "autofix")[:100]
-          summary = str(result.get("summary") or "(要約なし)")[:2000]
-
-          if not isinstance(files, dict) or not files:
-              print("::error::filesが空です。修正内容を生成できなかった可能性があります。中断します。")
-              sys.exit(1)
-
-          violations = ai_pipeline.validate_paths(list(files.keys()))
-          if violations:
-              print(f"::error::許可リスト外のパスが含まれています: {violations}。中断します。")
-              sys.exit(1)
-
-          for path, content in files.items():
-              if not isinstance(content, str):
-                  print(f"::error::{path} の内容が文字列ではありません。中断します。")
-                  sys.exit(1)
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(content)
-              print(f"wrote {path} ({len(content)} bytes)")
-
-          with open(os.path.join(runner_temp, "expected_files.txt"), "w", encoding="utf-8") as f:
-              f.write("\n".join(sorted(files.keys())))
-          with open(os.path.join(runner_temp, "commit_msg.txt"), "w", encoding="utf-8") as f:
-              f.write(f"autofix: {title}\n\n{summary}\n\nAI-Autofix-Attempt: true\n")
+          # 既存のautofixコミットメッセージ規約（"autofix: "プレフィックス）を維持する。
+          commit_msg_path = os.path.join(runner_temp, "commit_msg.txt")
+          with open(commit_msg_path, encoding="utf-8") as f:
+              commit_msg = f.read()
+          with open(commit_msg_path, "w", encoding="utf-8") as f:
+              f.write(f"autofix: {commit_msg}")
           PYEOF
 
-      - name: 変更が許可リスト・AI申告パスと完全一致することを検証
+      - name: 実際の変更セットを許可リストに対して最終検証
         if: steps.attempts.outputs.exhausted == 'false'
         run: |
           git add -A
-          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged_files.txt"
-          sort "$RUNNER_TEMP/expected_files.txt" > "$RUNNER_TEMP/expected_files_sorted.txt"
-          if [ ! -s "$RUNNER_TEMP/staged_files.txt" ]; then
-            echo "::error::変更がありませんでした。中断します。"
-            exit 1
-          fi
-          if ! diff -q "$RUNNER_TEMP/staged_files.txt" "$RUNNER_TEMP/expected_files_sorted.txt" > /dev/null; then
-            echo "::error::実際に変更されたファイルがAI申告分と一致しません。"
-            echo "staged:"; cat "$RUNNER_TEMP/staged_files.txt"
-            echo "expected:"; cat "$RUNNER_TEMP/expected_files_sorted.txt"
-            exit 1
-          fi
+          git diff --cached --no-renames -z --name-status \
+            | python3 "$RUNNER_TEMP/trusted/.github/scripts/ai_pipeline.py" check-diff \
+            > "$RUNNER_TEMP/staged_files.txt"
 
       - name: Nix構文チェック（括弧バランス等。ビルド検証自体はcheck-light.ymlに委ねる）
         if: steps.attempts.outputs.exhausted == 'false'
@@ -317,7 +266,7 @@ jobs:
           git config user.name "ai-issue-handler[bot]"
           git config user.email "ai-issue-handler@users.noreply.github.com"
           git commit -F "$RUNNER_TEMP/commit_msg.txt"
-          git push origin "HEAD:$BRANCH"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "HEAD:$BRANCH"
 
       - name: アドバイザリスキャンでヒットがあればPRにラベル付け
         if: steps.attempts.outputs.exhausted == 'false'
