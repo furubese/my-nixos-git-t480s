@@ -23,10 +23,12 @@ in
   hardware.graphics.enable = true;
 
   # ログインマネージャ: greetd + tuigreet → niri セッション
+  # 注: nixpkgs で greetd.tuigreet は tuigreet にリネームされたため
+  # 現行の属性名 pkgs.tuigreet を参照する (issue #79)。
   services.greetd = {
     enable = true;
     settings.default_session.command =
-      "${pkgs.greetd.tuigreet}/bin/tuigreet --time --remember --cmd ${pkgs.niri}/bin/niri";
+      "${pkgs.tuigreet}/bin/tuigreet --time --remember --cmd ${pkgs.niri}/bin/niri";
   };
 
   # 音声: PipeWire + WirePlumber (wpctl のバックエンド)
