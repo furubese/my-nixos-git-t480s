@@ -50,9 +50,11 @@ in
   };
 
   # 日本語デスクトップ用フォント
+  # 注: 旧 noto-fonts-emoji は 2025-10-27 の nixpkgs 変更で noto-fonts-color-emoji
+  # へリネームされたため、現行の属性名を参照する。
   fonts.packages = with pkgs; [
     noto-fonts-cjk-sans
-    noto-fonts-emoji
+    noto-fonts-color-emoji
   ];
 
   environment.systemPackages = with pkgs; [
