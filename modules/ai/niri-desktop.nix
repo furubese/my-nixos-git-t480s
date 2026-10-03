@@ -1,34 +1,74 @@
-# niri + greetd(tuigreet) によるデスクトップ環境（issue #17で導入）。
-# issue #59: nixpkgsのパッケージ再編成にともない、参照するパッケージ属性を
-# 現行のトップレベル名へ更新した（X11系ライブラリは xorg 属性セット配下から、
-# tuigreet は greetd パッケージ群のサブ属性から、それぞれ移動済み）。
+# niri + noctalia デスクトップ環境 (issue #76)
+# 普段使いの Fedora (niri + noctalia) 環境に寄せた構成。
+# - niri本体とWaylandセッションは programs.niri.enable が提供
+# - ログインは greetd + tuigreet (issue #17 の構成を維持)
+# - noctalia は niri設定 (home/ai/niri.kdl) の spawn-at-startup から起動
+# - niri / noctalia の設定ファイル本体は home/ai/niri.nix, home/ai/noctalia.nix がデプロイ
 { pkgs, ... }:
+
+let
+  # カーソルテーマ (niri.kdl の cursor.xcursor-theme で参照)。
+  # nixpkgs に catppuccin-cursors があれば frappe-green 相当のバリアントを導入。
+  # なければスキップする (存在チェックによりビルドは壊さない)。
+  catppuccinCursors =
+    if (pkgs ? catppuccin-cursors) && (pkgs.catppuccin-cursors ? frappeGreen)
+    then [ pkgs.catppuccin-cursors.frappeGreen ]
+    else [ ];
+in
 {
-  # niriウィンドウマネージャーを有効化。
-  # niriパッケージ自体もここから自動で導入されるため、
-  # modules/packages.nix 側での個別指定は不要。
+  # Waylandコンポジタ
   programs.niri.enable = true;
 
-  # ログインマネージャー: greetd 上で tuigreet（ターミナルUIグリーター）を
-  # 実行し、niri セッションを起動する。tuigreet は nixpkgs のトップレベル
-  # 属性（pkgs.tuigreet）へ移動済みのため、そちらを参照する。
+  # niri のレンダリングに必要
+  hardware.graphics.enable = true;
+
+  # ログインマネージャ: greetd + tuigreet → niri セッション
   services.greetd = {
     enable = true;
-    settings = {
-      default_session = {
-        command = "${pkgs.tuigreet}/bin/tuigreet --time --cmd niri-session";
-        user = "fse";
-      };
-    };
+    settings.default_session.command =
+      "${pkgs.greetd.tuigreet}/bin/tuigreet --time --remember --cmd ${pkgs.niri}/bin/niri";
   };
 
-  # X11/XWayland アプリケーション用のクライアントライブラリ。
-  # nixpkgs の再編成で xorg 属性セット配下からトップレベルの小文字名へ
-  # 移動しているため、現行名で参照する。
-  environment.systemPackages = with pkgs; [
-    libx11
-    libxcursor
-    libxi
-    libxrandr
+  # 音声: PipeWire + WirePlumber (wpctl のバックエンド)
+  security.rtkit.enable = true;
+  services.pipewire = {
+    enable = true;
+    alsa.enable = true;
+    pulse.enable = true;
+  };
+
+  # polkit (noctalia の polkit_agent が使用)
+  security.polkit.enable = true;
+
+  # XDGポータル (ファイルダイアログ・スクリーンキャスト等)
+  xdg.portal = {
+    enable = true;
+    extraPortals = with pkgs; [
+      xdg-desktop-portal-gtk
+      xdg-desktop-portal-gnome
+    ];
+  };
+
+  # 日本語デスクトップ用フォント
+  # 注: 旧 noto-fonts-emoji は 2025-10-27 の nixpkgs 変更で noto-fonts-color-emoji
+  # へリネームされたため、現行の属性名を参照する。
+  fonts.packages = with pkgs; [
+    noto-fonts-cjk-sans
+    noto-fonts-color-emoji
   ];
+
+  environment.systemPackages = with pkgs; [
+    noctalia # デスクトップシェル (niri.kdl から起動)
+    alacritty # ターミナル (niri.kdl の Mod+T)
+    firefox # ドックにpinするブラウザ
+    brightnessctl # 輝度キー (niri.kdl のbinds)
+    playerctl # メディアキー (同上)
+    wireplumber # wpctl (音量キー)
+  ] ++ catppuccinCursors;
+
+  # XWayland / Qt アプリにもカーソルテーマを反映
+  environment.sessionVariables = {
+    XCURSOR_THEME = "catppuccin-frappe-green-cursors";
+    XCURSOR_SIZE = "32";
+  };
 }
