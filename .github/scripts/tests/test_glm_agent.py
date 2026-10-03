@@ -279,8 +279,8 @@ class AgentLoopLimitTests(unittest.TestCase):
         import inspect
 
         sig = inspect.signature(glm_agent.run_agent_loop)
-        self.assertEqual(sig.parameters["max_turns"].default, 15)
-        self.assertEqual(sig.parameters["max_tool_calls"].default, 40)
+        self.assertEqual(sig.parameters["max_turns"].default, 25)
+        self.assertEqual(sig.parameters["max_tool_calls"].default, 60)
 
     def test_turn_limit_aborts_without_submit(self):
         def fake_request(_payload):

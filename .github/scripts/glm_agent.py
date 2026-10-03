@@ -410,8 +410,8 @@ def _write_outputs(title, summary, commit_trailer, output_dir):
 def run_agent_loop(
     initial_message,
     commit_trailer=None,
-    max_turns=15,
-    max_tool_calls=40,
+    max_turns=25,
+    max_tool_calls=60,
     *,
     repo_root=None,
     output_dir=None,
