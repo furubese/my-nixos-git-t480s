@@ -1,28 +1,8 @@
-# Bottles（Wineプレフィックスマネージャー）の導入。
-#
-# issue #62: nixpkgsでX11ライブラリの属性名が変更され、xorg.libX11 などの
-# 旧 xorg.* 属性はトップレベルの小文字名（libx11 など）へ移行した。
-# これに合わせて、パッケージ参照をすべて新名称に更新した（構成の変更はなし）。
-#
-# NixOSはFHSレイアウトではないため、Wineランナーが実行時に必要とする
-# X11ライブラリは明示的に導入しておく。
-{ pkgs, ... }:
-{
-  environment.systemPackages = with pkgs; [
-    bottles
-
-    # Wineが必要とするX11ライブラリ（旧 xorg.libX* → 新 libx*）
-    libx11
-    libxcomposite
-    libxcursor
-    libxdamage
-    libxext
-    libxfixes
-    libxi
-    libxinerama
-    libxrandr
-    libxrender
-    libxtst
-    libxxf86vm
-  ];
-}
+# issue #68 で廃止 (no-op 化)。
+# アプリケーション名は Bottles (複数形) のため、設定は正しいファイル名の
+# bottles.nix 側に統合した。
+# なお統合時に移設した xorg.libX11 などの属性名は旧名だったことがPRレビューで
+# 判明したため、bottles.nix 側で現行のトップレベル名 (libx11 等) へ修正済み。
+# 本ワークフローではファイルを削除できないため空のモジュールとして残しており、
+# 重複解消後は人間がこのファイルを削除して問題ない。
+{ ... }: { }

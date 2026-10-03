@@ -1,45 +1,53 @@
-# issue #24: Bottles（Wineボトル管理GUI）のインストール。
+# Bottles (Wine プレフィックスマネージャ) の導入。issue #68 で重複を解消。
 #
-# Bottlesはパッケージ単体では完結せず、初回起動時に公式のプレビルドWineランナー
-# （Soda/Caffe等）をダウンロードして実行する。ランナーはFHS環境を前提とした
-# 未パッチの動的リンクバイナリ（ELFインタプリタ = /lib64/ld-linux-x86-64.so.2）
-# のため、素のNixOSではローダが解決できず起動に失敗する。
-# 「パッケージだけ入って実際には動かない」状態（modules/packages.nix のコメントに
-# 残る旧設計の失敗パターン）を避けるため、programs.nix-ld を有効化し、
-# ランナーが必要とする基本ライブラリを NIX_LD_LIBRARY_PATH で解決できるようにする。
+# PRレビュー指摘を反映した修正:
+#
+# 1. プレビルドWineランナーが動的リンクする基本ライブラリを復元した。
+#    これらは不要になったわけではなく、issue #68 の bottle.nix / bottles.nix
+#    統合時に誤って取り込むのを落としていた。Bottles がダウンロードする
+#    プレビルドの Wine ランナーは FHS パスを前提に動的リンクするため、
+#    FHS 非準拠の NixOS では必要な共有ライブラリをシステムプロファイルに
+#    明示的に用意しておく必要がある。Windowsアプリ側でさらに不足が出た
+#    場合はこのリストへ追記する。
+#
+# 2. X11 系ライブラリの属性名を現行名へ更新した。
+#    統合時に移設した xorg.libX11 などの属性名は issue #59 の nixpkgs
+#    パッケージ再編成より前の旧名だった。現行 nixpkgs では X11 系ライブラリは
+#    xorg 属性セット配下からトップレベルの小文字名へ移動しているため
+#    (modules/ai/niri-desktop.nix と同一の命名)、現行名へ置き換えた。
 { pkgs, ... }:
 {
-  environment.systemPackages = with pkgs; [ bottles ];
+  environment.systemPackages = with pkgs; [
+    bottles
 
-  programs.nix-ld = {
-    enable = true;
-    # プレビルドWineランナーが動的リンクする基本ライブラリ。
+    # --- プレビルドWineランナーが動的リンクする基本ライブラリ ---
     # Windowsアプリ側でさらに不足が出た場合はここへ追記する。
-    libraries = with pkgs; [
-      alsa-lib # winealsa.drv（ALSAオーディオ）
-      fontconfig
-      freetype # Wineのフォントレンダリング
-      glib
-      libGL # OpenGL（libglvnd経由）
-      libdrm
-      libpulseaudio # winepulse.drv（PipeWire/PulseAudioオーディオ）
-      libxkbcommon
-      mesa # GLベンダー（libGLX_mesa等）の発見用
-      stdenv.cc.cc # libstdc++ / libgcc_s
-      vulkan-loader # DXVK等のVulkan翻訳層用
-      xorg.libX11
-      xorg.libXcomposite
-      xorg.libXcursor
-      xorg.libXdamage
-      xorg.libXext
-      xorg.libXfixes
-      xorg.libXi
-      xorg.libXinerama
-      xorg.libXrandr
-      xorg.libXrender
-      xorg.libXxf86vm
-      xorg.libxcb
-      zlib
-    ];
-  };
+    alsa-lib       # winealsa.drv（ALSAオーディオ）
+    fontconfig
+    freetype       # Wineのフォントレンダリング
+    glib
+    libGL          # OpenGL（libglvnd経由）
+    libdrm
+    libpulseaudio  # winepulse.drv（PipeWire/PulseAudioオーディオ）
+    libxkbcommon
+    mesa           # GLベンダー（libGLX_mesa等）の発見用
+    stdenv.cc.cc   # libstdc++ / libgcc_s
+    vulkan-loader  # DXVK等のVulkan翻訳層用
+
+    # --- X11 系クライアントライブラリ（現行のトップレベル名） ---
+    # Wine が Windows アプリ実行時に動的リンクする共有ライブラリ。
+    # NixOS は FHS 非準拠のため、bottles の実行環境から解決できるよう
+    # システムプロファイルに明示的に導入する。
+    libx11
+    libxcursor
+    libxrandr
+    libxi
+    libxext
+    libxrender
+    libxfixes
+    libxcomposite
+    libxdamage
+    libxinerama
+    libxkbfile
+  ];
 }
