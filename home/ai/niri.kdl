@@ -58,8 +58,17 @@ prefer-no-csd
 // スクリーンショットの保存先
 screenshot-path "~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png"
 
-// 自動起動が必要になったらコメントを外して使う
-// spawn-at-startup "waybar"
+// Noctaliaデスクトップシェル（issue #64）の自動起動。
+// PRレビュー指摘「noctaliaの設定が不足しています」への対応として、このniri設定に
+// 欠けていた spawn-at-startup を追加した。これがないとNoctaliaのパッケージを
+// 導入していてもniriセッション開始時に起動しない（tests/ai/noctalia_test.nix の
+// assertionも失敗する）。
+// bar・通知・ランチャー等はNoctalia自身が提供するため、waybar等の他のbarを
+// 自動起動する必要はない。
+// なお、パッケージ導入は modules/ai/noctalia.nix、ユーザー設定
+// （~/.config/noctalia/settings.toml）は人間管理の home/noctalia.nix /
+// home/noctalia-settings.toml が担っており、そちらは変更していない。
+spawn-at-startup "noctalia"
 
 binds {
     // キーバインド一覧（ホットキーオーバーレイ）を表示
