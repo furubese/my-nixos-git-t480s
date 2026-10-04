@@ -205,6 +205,13 @@ jobs:
           # 分けると、継続行のインデントがそのまま文字列内の余分な空白として
           # 混入し、glm分岐とバイト単位で食い違う）。
           trailer=$'AI-generated (pi harness, OpenRouter GLM 5.3), needs review.\nRefs #'"$ISSUE_NUMBER"
+          # 実測（issue #101, run 37170780678）：既定値（glmの現行ライブ値15/40と同一）では
+          # niri/noctalia見直しのような複数ファイル調査タスクでglmと全く同じ故障モード
+          # （ツール呼び出し上限到達、submit未呼び出し）を再現した。ユーザーの指示により、
+          # pi分岐のみ一時的に上限を上げて再テストする（glm分岐は15/40のまま変更しない——
+          # ハーネスの差ではなく予算の差を見る比較になるため、結果は参考値として扱うこと）。
+          export PI_MAX_TURNS=25
+          export PI_MAX_TOOL_CALLS=60
           "$GITHUB_WORKSPACE/_trusted/.github/scripts/pi_run.sh" \
             --repo-root "$GITHUB_WORKSPACE" \
             --runner-temp "$RUNNER_TEMP" \
