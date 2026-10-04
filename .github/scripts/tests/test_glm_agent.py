@@ -21,6 +21,8 @@ Covers (see .omc/plans/glm-agentic-workflow-tools.md, step 9):
       A/D-pair form it exists to protect)
   (g) the sanitize_text() contract on initial_message
 """
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -35,6 +37,14 @@ sys.path.insert(0, SCRIPTS_DIR)
 
 import ai_pipeline  # noqa: E402
 import glm_agent  # noqa: E402
+
+AI_PIPELINE = os.path.join(SCRIPTS_DIR, "ai_pipeline.py")
+
+# The one golden commit_msg.txt literal for title="t"/summary="s"/trailer=
+# "AI-Autofix-Attempt: true". Both the glm_agent.run_agent_loop test and the
+# agent-submit CLI parity test assert against *this* string, so the two paths
+# cannot silently diverge from each other.
+GOLDEN_AUTOFIX_COMMIT_MSG = "t\n\ns\n\nAI-Autofix-Attempt: true\n"
 
 
 # --- (b) run_command allow-list / deny-list ---------------------------------
@@ -87,19 +97,19 @@ class RunCommandAllowListTests(unittest.TestCase):
                 with self.assertRaises(glm_agent.ToolDenied):
                     self.session.run_command(argv)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_allows_niri_validate(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
         result = self.session.run_command(["niri", "validate", "-c", "home/ai/niri.kdl"])
         self.assertIn("exit_code=0", result)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_allows_nix_instantiate_parse(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         result = self.session.run_command(["nix-instantiate", "--parse", "modules/ai/foo.nix"])
         self.assertIn("exit_code=0", result)
 
-    @mock.patch("glm_agent.subprocess.run")
+    @mock.patch("ai_pipeline.subprocess.run")
     def test_env_excludes_secret_like_names(self, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "x", "SOME_TOKEN": "y"}):
@@ -370,7 +380,7 @@ class AgentLoopLimitTests(unittest.TestCase):
         # autofixの試行回数トレーラー契約: commit_trailer指定時は
         # "{title}\n\n{summary}\n\n{commit_trailer}\n" と完全一致すること。
         commit_msg = self._run_to_submit("AI-Autofix-Attempt: true")
-        self.assertEqual(commit_msg, "t\n\ns\n\nAI-Autofix-Attempt: true\n")
+        self.assertEqual(commit_msg, GOLDEN_AUTOFIX_COMMIT_MSG)
 
     def test_no_commit_trailer_means_no_trailer_text_in_commit_message(self):
         # feedbackのトレーラーなしリセット契約: commit_trailer=Noneのとき
@@ -521,6 +531,500 @@ class SanitizeTextContractTests(unittest.TestCase):
         # run_agent_loop自身はsanitize_text()を呼ばない（呼び出し元の責務）。この契約が
         # docstringから silently失われていないことを確認する回帰テスト。
         self.assertIn("sanitize_text", glm_agent.run_agent_loop.__doc__)
+
+
+# --- (h) the agent-* CLI boundary (pi harness) ------------------------------
+#
+# These cross a real process boundary on purpose: the pi wrapper only ever sees
+# argv, stdin, stdout and the exit code, so testing the Python functions
+# directly would not prove the contract the wrapper depends on.
+
+
+def _run_agent_cli(argv, stdin="", env=None):
+    return subprocess.run(
+        [sys.executable, AI_PIPELINE, *argv],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+class _AgentCliCase(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.state_dir = tempfile.mkdtemp()
+        self.state_file = os.path.join(self.state_dir, "written_paths.json")
+        os.makedirs(os.path.join(self.root, "modules", "ai"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
+    def sandbox_args(self, state_file=None):
+        return ["--repo-root", self.root, "--state-file", state_file or self.state_file]
+
+    def assertEnvelope(self, result, kind=None):
+        """Assert the full stdout contract and return the parsed envelope."""
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("\n"))
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        envelope = json.loads(result.stdout)
+        self.assertEqual(set(envelope), {"ok", "kind", "result"})
+        self.assertIsInstance(envelope["ok"], bool)
+        self.assertIsInstance(envelope["result"], str)
+        self.assertIn(envelope["kind"], ("ok", "denied", "error"))
+        self.assertIs(envelope["ok"], envelope["kind"] == "ok")
+        if kind is not None:
+            self.assertEqual(envelope["kind"], kind, msg=envelope["result"])
+        return envelope
+
+    def write_repo_file(self, relative, content):
+        full = os.path.join(self.root, relative)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        return full
+
+
+class AgentCliEnvelopeTests(_AgentCliCase):
+    def test_read_file_ok(self):
+        self.write_repo_file("modules/ai/foo.nix", "{}")
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "modules/ai/foo.nix"]),
+            "ok",
+        )
+        self.assertEqual(envelope["result"], "{}")
+
+    def test_read_file_denied_for_secrets(self):
+        self.write_repo_file("secrets/token.txt", "sekret")
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "secrets/token.txt"]),
+            "denied",
+        )
+        self.assertNotIn("sekret", envelope["result"])
+
+    def test_read_file_denied_for_traversal_escape(self):
+        self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "../outside.txt"]),
+            "denied",
+        )
+
+    def test_read_file_result_is_truncated_to_max_output_chars(self):
+        self.write_repo_file("modules/ai/big.nix", "x" * 5000)
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "modules/ai/big.nix"]),
+            "ok",
+        )
+        self.assertEqual(
+            envelope["result"], "x" * ai_pipeline.MAX_OUTPUT_CHARS + "\n...(truncated, 5000 chars total)"
+        )
+
+    def test_list_dir_ok(self):
+        self.write_repo_file("modules/ai/foo.nix", "{}")
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-list-dir", *self.sandbox_args(), "--path", "modules/ai"]), "ok"
+        )
+        self.assertEqual(envelope["result"], "foo.nix")
+
+    def test_list_dir_denied_for_dot_git(self):
+        os.makedirs(os.path.join(self.root, ".git"))
+        self.assertEnvelope(
+            _run_agent_cli(["agent-list-dir", *self.sandbox_args(), "--path", ".git"]), "denied"
+        )
+
+    def test_write_file_ok_reads_content_from_stdin(self):
+        envelope = self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/new.nix"],
+                stdin="{ pkgs, ... }: { }\n",
+            ),
+            "ok",
+        )
+        self.assertEqual(envelope["result"], "wrote modules/ai/new.nix (19 bytes)")
+        with open(os.path.join(self.root, "modules/ai/new.nix"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "{ pkgs, ... }: { }\n")
+
+    def test_write_file_denied_outside_scope_and_nothing_is_created(self):
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "hosts/t480s.nix"], stdin="{}"
+            ),
+            "denied",
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.root, "hosts/t480s.nix")))
+
+    def test_write_file_denied_for_default_nix(self):
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/default.nix"],
+                stdin="{}",
+            ),
+            "denied",
+        )
+
+    def test_delete_file_denied_when_neither_tracked_nor_written(self):
+        self.write_repo_file("modules/ai/orphan.nix", "{}")
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-delete-file", *self.sandbox_args(), "--path", "modules/ai/orphan.nix"]
+            ),
+            "denied",
+        )
+        self.assertTrue(os.path.exists(os.path.join(self.root, "modules/ai/orphan.nix")))
+
+    def test_run_command_denied_outside_the_allowlist(self):
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-run-command", *self.sandbox_args(), "--", "rm", "-rf", "/"]),
+            "denied",
+        )
+        self.assertIn("not allowed", envelope["result"])
+
+    def test_run_command_denied_for_eval_flag_after_the_separator(self):
+        # The `--` split must hand --impure to run_command's deny-list rather
+        # than letting argparse claim it as an ai_pipeline.py option.
+        self.assertEnvelope(
+            _run_agent_cli(
+                [
+                    "agent-run-command",
+                    *self.sandbox_args(),
+                    "--",
+                    "nix-instantiate",
+                    "--impure",
+                    "--parse",
+                    "modules/ai/foo.nix",
+                ]
+            ),
+            "denied",
+        )
+
+    def test_run_command_denied_when_no_command_follows(self):
+        self.assertEnvelope(
+            _run_agent_cli(["agent-run-command", *self.sandbox_args()]), "denied"
+        )
+
+    def test_run_command_ok_executes_the_real_binary(self):
+        # A stub on PATH rather than the real nix-instantiate, so the test
+        # asserts the same envelope on a machine without Nix installed.
+        bin_dir = os.path.join(self.state_dir, "bin")
+        os.makedirs(bin_dir)
+        stub = os.path.join(bin_dir, "nix-instantiate")
+        with open(stub, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\necho parsed\necho noise >&2\nexit 0\n")
+        os.chmod(stub, 0o755)
+        env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"])
+        envelope = self.assertEnvelope(
+            _run_agent_cli(
+                [
+                    "agent-run-command",
+                    *self.sandbox_args(),
+                    "--",
+                    "nix-instantiate",
+                    "--parse",
+                    "modules/ai/foo.nix",
+                ],
+                env=env,
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            envelope["result"],
+            "exit_code=0\n--- stdout ---\nparsed\n\n--- stderr ---\nnoise\n",
+        )
+
+    def test_malformed_invocation_exits_nonzero_and_prints_no_envelope(self):
+        for argv in (
+            ["agent-read-file", "--repo-root", self.root],  # missing --state-file
+            ["agent-read-file", *self.sandbox_args()],  # missing --path
+            ["agent-nonexistent", *self.sandbox_args()],
+        ):
+            with self.subTest(argv=argv):
+                result = _run_agent_cli(argv)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+
+class AgentStateFileTests(_AgentCliCase):
+    """--state-file carries written_paths across the process boundary, because
+    each agent-* call is its own process and delete_file must still know what
+    this run created."""
+
+    def test_write_then_delete_in_separate_processes_is_allowed(self):
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/scratch.nix"],
+                stdin="{}",
+            ),
+            "ok",
+        )
+        envelope = self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-delete-file", *self.sandbox_args(), "--path", "modules/ai/scratch.nix"]
+            ),
+            "ok",
+        )
+        self.assertEqual(envelope["result"], "deleted modules/ai/scratch.nix")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "modules/ai/scratch.nix")))
+
+    def test_written_paths_do_not_carry_over_to_a_different_state_file(self):
+        # Run isolation: the same file, written under run A's state file, must
+        # not be deletable by run B.
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/scratch.nix"],
+                stdin="{}",
+            ),
+            "ok",
+        )
+        other_state = os.path.join(self.state_dir, "run-b.json")
+        self.assertEnvelope(
+            _run_agent_cli(
+                [
+                    "agent-delete-file",
+                    *self.sandbox_args(state_file=other_state),
+                    "--path",
+                    "modules/ai/scratch.nix",
+                ]
+            ),
+            "denied",
+        )
+        self.assertTrue(os.path.exists(os.path.join(self.root, "modules/ai/scratch.nix")))
+
+    def test_delete_discards_the_path_from_the_persisted_set(self):
+        _run_agent_cli(
+            ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/scratch.nix"],
+            stdin="{}",
+        )
+        with open(self.state_file, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), ["modules/ai/scratch.nix"])
+        _run_agent_cli(
+            ["agent-delete-file", *self.sandbox_args(), "--path", "modules/ai/scratch.nix"]
+        )
+        with open(self.state_file, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), [])
+
+    def test_missing_state_file_is_an_empty_set_for_a_read(self):
+        self.write_repo_file("modules/ai/foo.nix", "{}")
+        self.assertFalse(os.path.exists(self.state_file))
+        self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "modules/ai/foo.nix"]),
+            "ok",
+        )
+        self.assertFalse(os.path.exists(self.state_file))
+
+    def test_missing_state_file_still_allows_the_first_write(self):
+        self.assertFalse(os.path.exists(self.state_file))
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/first.nix"],
+                stdin="{}",
+            ),
+            "ok",
+        )
+        with open(self.state_file, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), ["modules/ai/first.nix"])
+
+    def test_corrupt_state_file_fails_closed_on_a_read(self):
+        with open(self.state_file, "w", encoding="utf-8") as handle:
+            handle.write("not json at all")
+        self.write_repo_file("modules/ai/foo.nix", "{}")
+        envelope = self.assertEnvelope(
+            _run_agent_cli(["agent-read-file", *self.sandbox_args(), "--path", "modules/ai/foo.nix"]),
+            "error",
+        )
+        self.assertIn("not valid JSON", envelope["result"])
+
+    def test_corrupt_state_file_fails_closed_on_a_write_without_resetting_it(self):
+        # Deliberate security choice: a state file we cannot parse must refuse
+        # the operation, never silently restart from an empty written_paths set
+        # (an empty set is the permissive direction for delete_file's
+        # "written during this run" check).
+        with open(self.state_file, "w", encoding="utf-8") as handle:
+            handle.write('{"not": "a list"}')
+        envelope = self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-write-file", *self.sandbox_args(), "--path", "modules/ai/new.nix"],
+                stdin="{}",
+            ),
+            "error",
+        )
+        self.assertIn("not a JSON array of strings", envelope["result"])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "modules/ai/new.nix")))
+        with open(self.state_file, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), '{"not": "a list"}')
+
+    def test_state_file_of_wrong_element_type_fails_closed(self):
+        with open(self.state_file, "w", encoding="utf-8") as handle:
+            json.dump(["modules/ai/a.nix", 7], handle)
+        self.assertEnvelope(
+            _run_agent_cli(
+                ["agent-delete-file", *self.sandbox_args(), "--path", "modules/ai/a.nix"]
+            ),
+            "error",
+        )
+
+
+class AgentSubmitCliTests(unittest.TestCase):
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+
+    def submit(self, **options):
+        argv = ["agent-submit", "--output-dir", self.output_dir]
+        for name, value in options.items():
+            if value is not None:
+                argv += ["--" + name.replace("_", "-"), value]
+        result = _run_agent_cli(argv)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)
+
+    def read_output(self, name):
+        with open(os.path.join(self.output_dir, name), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_writes_the_three_output_files(self):
+        envelope = self.submit(title="t", summary="s")
+        self.assertEqual(envelope, {"ok": True, "kind": "ok", "result": "submitted: t"})
+        self.assertEqual(self.read_output("pr_title.txt"), "t")
+        self.assertEqual(self.read_output("pr_summary.txt"), "s")
+        self.assertEqual(self.read_output("commit_msg.txt"), "t\n\ns\n")
+
+    def test_missing_title_and_summary_become_empty_strings(self):
+        self.submit()
+        self.assertEqual(self.read_output("pr_title.txt"), "")
+        self.assertEqual(self.read_output("pr_summary.txt"), "")
+
+    def test_title_is_truncated_to_100_chars_like_dispatch(self):
+        self.submit(title="T" * 150, summary="s")
+        self.assertEqual(self.read_output("pr_title.txt"), "T" * 100)
+
+    def test_summary_is_truncated_to_4000_chars_like_dispatch(self):
+        self.submit(title="t", summary="S" * 5000)
+        self.assertEqual(self.read_output("pr_summary.txt"), "S" * 4000)
+
+    def test_truncated_title_and_summary_also_shape_the_commit_message(self):
+        self.submit(title="T" * 150, summary="S" * 5000, commit_trailer="AI-Autofix-Attempt: true")
+        self.assertEqual(
+            self.read_output("commit_msg.txt"),
+            "T" * 100 + "\n\n" + "S" * 4000 + "\n\nAI-Autofix-Attempt: true\n",
+        )
+
+    def test_commit_msg_matches_the_glm_agent_golden_literal(self):
+        self.submit(title="t", summary="s", commit_trailer="AI-Autofix-Attempt: true")
+        self.assertEqual(self.read_output("commit_msg.txt"), GOLDEN_AUTOFIX_COMMIT_MSG)
+
+    def test_message_prefix_is_byte_identical_to_the_yaml_inline_rewrite(self):
+        # ai-issue-autofix.yml:209-214 reads commit_msg.txt back and rewrites it
+        # as f"autofix: {commit_msg}". --message-prefix moves that into Python,
+        # so the resulting bytes must be exactly the same.
+        yaml_inline_rewrite = f"autofix: {GOLDEN_AUTOFIX_COMMIT_MSG}"
+        self.submit(
+            title="t",
+            summary="s",
+            commit_trailer="AI-Autofix-Attempt: true",
+            message_prefix="autofix: ",
+        )
+        self.assertEqual(self.read_output("commit_msg.txt"), yaml_inline_rewrite)
+
+    def test_prefixed_commit_msg_still_satisfies_the_attempt_counter_grep(self):
+        # ai-issue-autofix.yml:104 runs `grep -q '^AI-Autofix-Attempt: true$'`;
+        # a stray CR or a missing newline there silently pins the retry counter
+        # at 0 and the 3-attempt cap stops working.
+        self.submit(
+            title="t",
+            summary="s",
+            commit_trailer="AI-Autofix-Attempt: true",
+            message_prefix="autofix: ",
+        )
+        commit_msg = self.read_output("commit_msg.txt")
+        self.assertNotIn("\r", commit_msg)
+        self.assertRegex(commit_msg, r"(?m)^AI-Autofix-Attempt: true$")
+
+    def test_message_prefix_does_not_leak_into_pr_title_or_summary(self):
+        self.submit(title="t", summary="s", message_prefix="autofix: ")
+        self.assertEqual(self.read_output("pr_title.txt"), "t")
+        self.assertEqual(self.read_output("pr_summary.txt"), "s")
+
+    def test_unwritable_output_dir_is_an_error_envelope_not_a_traceback(self):
+        result = _run_agent_cli(
+            [
+                "agent-submit",
+                "--output-dir",
+                os.path.join(self.output_dir, "nonexistent"),
+                "--title",
+                "t",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        envelope = json.loads(result.stdout)
+        self.assertEqual(envelope["kind"], "error")
+        self.assertFalse(envelope["ok"])
+
+
+class AgentRunCommandTimeoutTests(unittest.TestCase):
+    """A timed-out command is informational feedback for the model (kind "ok"),
+    not a tool error -- same as glm_agent.py's loop before the CLI split."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.state_file = os.path.join(self.root, "state.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _main_stdout(self, argv):
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["ai_pipeline.py", *argv]):
+            with contextlib.redirect_stdout(stdout):
+                ai_pipeline.main()
+        return stdout.getvalue()
+
+    @mock.patch("ai_pipeline.subprocess.run")
+    def test_timeout_is_reported_as_an_ok_envelope(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="nix-instantiate", timeout=120)
+        stdout = self._main_stdout(
+            [
+                "agent-run-command",
+                "--repo-root",
+                self.root,
+                "--state-file",
+                self.state_file,
+                "--",
+                "nix-instantiate",
+                "--parse",
+                "modules/ai/foo.nix",
+            ]
+        )
+        self.assertEqual(
+            json.loads(stdout),
+            {"ok": True, "kind": "ok", "result": "command timed out after 120s"},
+        )
+
+    @mock.patch("ai_pipeline.subprocess.run")
+    def test_missing_binary_is_a_denied_envelope(self, mock_run):
+        mock_run.side_effect = FileNotFoundError
+        stdout = self._main_stdout(
+            [
+                "agent-run-command",
+                "--repo-root",
+                self.root,
+                "--state-file",
+                self.state_file,
+                "--",
+                "niri",
+                "validate",
+                "-c",
+                "home/ai/niri.kdl",
+            ]
+        )
+        envelope = json.loads(stdout)
+        self.assertEqual(envelope["kind"], "denied")
+        self.assertIn("is not installed on this runner", envelope["result"])
 
 
 if __name__ == "__main__":
