@@ -99,6 +99,16 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
 
+      - name: Cachix（piのビルド用、読み取りのみ・pushなし）
+        if: vars.AI_HANDLER_ENGINE == 'pi'
+        uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          # install-nix-action直後・"niriをインストール"（nix profile install）より前に
+          # 置く必要がある（ai-issue-autofix.ymlと同じ理由、.omc/plans/pi-harness-migration.md
+          # v7参照：nix profile installが先に走るとnix-envベースのcachixインストーラが
+          # 「profile is incompatible with nix-env」で失敗する）。
+
       - name: niriをインストール（flake.lockのピンを使用。--inputs-from . 必須）
         timeout-minutes: 5
         run: nix profile install --inputs-from . nixpkgs#niri
@@ -122,7 +132,7 @@ jobs:
               ;;
           esac
 
-      - name: GLMエージェントループを実行し、許可パスへ書き込む
+      - name: モデルへの初回メッセージを構築（glm/pi両分岐が同じファイルを読む）
         run: |
           python3 <<'PYEOF'
           import os
@@ -130,7 +140,6 @@ jobs:
 
           sys.path.insert(0, "_trusted/.github/scripts")
           import ai_pipeline  # noqa: E402
-          import glm_agent  # noqa: E402
 
           runner_temp = os.environ["RUNNER_TEMP"]
           issue_number = os.environ["ISSUE_NUMBER"]
@@ -149,6 +158,27 @@ jobs:
           {issue_body}
           """
 
+          # 分岐ごとに組み立て直すとglm版とpi版でモデルに渡る文面が食い違う。
+          # 構築はここ1箇所だけで行い、両分岐はこのファイルを読むだけにする。
+          with open(os.path.join(runner_temp, "initial_message.txt"), "w", encoding="utf-8") as f:
+              f.write(initial_message)
+          PYEOF
+
+      - name: GLMエージェントループを実行し、許可パスへ書き込む
+        if: vars.AI_HANDLER_ENGINE != 'pi'
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import sys
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import glm_agent  # noqa: E402
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          issue_number = os.environ["ISSUE_NUMBER"]
+          with open(os.path.join(runner_temp, "initial_message.txt"), encoding="utf-8") as f:
+              initial_message = f.read()
+
           result = glm_agent.run_agent_loop(initial_message, commit_trailer=None)
           if result["aborted"]:
               sys.exit(1)
@@ -163,6 +193,28 @@ jobs:
           with open(os.path.join(runner_temp, "commit_msg_final.txt"), "w", encoding="utf-8") as f:
               f.write(final_commit_msg)
           PYEOF
+
+      - name: pi ハーネスで修正・検証・書き込みを行う
+        if: vars.AI_HANDLER_ENGINE == 'pi'
+        # _trusted/ はこのワークスペース内のサブディレクトリ（mainからのcheckout、上の
+        # ".git/info/exclude" 登録でこのブランチからは追跡されない）。autofixの
+        # $RUNNER_TEMP/trusted とは配置が異なるが、どちらも「mainからのcheckout」である
+        # という不変条件は同じ。submitが呼ばれずに終了した場合pi_run.sh自身がexit 1する。
+        run: |
+          # $'...\n...' を使う（YAMLブロックスカラー内でクォート文字列を複数行に
+          # 分けると、継続行のインデントがそのまま文字列内の余分な空白として
+          # 混入し、glm分岐とバイト単位で食い違う）。
+          trailer=$'AI-generated (pi harness, OpenRouter GLM 5.3), needs review.\nRefs #'"$ISSUE_NUMBER"
+          "$GITHUB_WORKSPACE/_trusted/.github/scripts/pi_run.sh" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --message-file "$RUNNER_TEMP/initial_message.txt" \
+            --commit-trailer "$trailer"
+          # agent-submitが書くcommit_msg.txtは、--commit-trailer適用後、glm分岐の
+          # final_commit_msg（base + "\n" + 2行のsuffix）とバイト単位で同一になる
+          # （ai_pipeline._write_outputsのtrailer追記が同じ"\n{trailer}\n"形式のため）。
+          # glm分岐のようにcommit_msg_final.txtへの改名だけ行う。
+          cp "$RUNNER_TEMP/commit_msg.txt" "$RUNNER_TEMP/commit_msg_final.txt"
 
       - name: 変更差分を検証（許可パスの最終再確認、A/Mパスのみ後続の検証ステップへ渡す）
         run: |
