@@ -54,7 +54,11 @@ jobs:
   ai-edit:
     if: (github.event_name == 'workflow_dispatch' || github.event.label.name == 'package-request') && vars.AI_PIPELINE_ENABLED == 'true' && vars.AI_AGENT_LOOP_HANDLER == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 40→90: glm分岐が中断した場合、同一ジョブ内で続けてpi分岐が走る（下の
+    # "pi ハーネス..." ステップの `if:` のエスカレーション条項）。最悪ケースは
+    # 「glmが予算を使い切る時間 + piの実行時間」の直列になるため、pi単独で既に
+    # 窮屈だった40分では足りない。
+    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -166,7 +170,11 @@ jobs:
       - uses: cachix/install-nix-action@v27
 
       - name: Cachix（piのビルド用、読み取りのみ・pushなし）
-        if: steps.resolve_engine.outputs.engine == 'pi'
+        # `if:` は付けない（engineが`glm`でも実行する）。glm分岐が中断すると同一ジョブ内で
+        # piへエスカレーションするため、piはengineの初期判定が`glm`だった場合でも後から
+        # 必要になりうる。このステップはジョブのこの位置（niriインストールより前）でしか
+        # 動かせず、その時点ではglmステップがまだ走っていないので
+        # `steps.run_glm.outputs.aborted` を条件にすることはできない。
         uses: cachix/cachix-action@v15
         with:
           name: nixos-furubese-t480s-5gb
@@ -231,6 +239,7 @@ jobs:
           PYEOF
 
       - name: GLMエージェントループを実行し、許可パスへ書き込む
+        id: run_glm
         if: steps.resolve_engine.outputs.engine != 'pi'
         run: |
           python3 <<'PYEOF'
@@ -245,9 +254,39 @@ jobs:
           with open(os.path.join(runner_temp, "initial_message.txt"), encoding="utf-8") as f:
               initial_message = f.read()
 
-          result = glm_agent.run_agent_loop(initial_message, commit_trailer=None)
+          # 予算は run_agent_loop の既定（max_turns=15 / max_tool_calls=40）ではなく、
+          # この呼び出し元で明示する。関数側の既定は ai-issue-autofix.yml と
+          # ai-issue-feedback.yml も使っているため、既定を書き換えるとそれらの挙動まで
+          # 変わってしまう（今回の変更対象外）。
+          # 実測の経緯（issue #92/#93/#102 を `gh workflow run` で再dispatch）：
+          # 3件すべてがissueと無関係なファイルの探索で既定15/40を使い切り、submitに
+          # 到達できなかった。このリポジトリでは既定が小さすぎる。
+          result = glm_agent.run_agent_loop(
+              initial_message,
+              commit_trailer=None,
+              max_turns=500,
+              max_tool_calls=500,
+          )
+
+          # pi分岐の `if:` がこの出力を読む。スキップされたステップの outputs は
+          # 空文字列になるので、`== 'true'` の比較はglm分岐が実際に走った場合にしか
+          # 真にならない。
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("aborted={}\n".format("true" if result["aborted"] else "false"))
+
           if result["aborted"]:
-              sys.exit(1)
+              # ここでジョブを落とさない（旧実装は sys.exit(1) だった）。同一ジョブ内で
+              # pi分岐がエスカレーションを引き受ける。commit_msg_final.txt はここでは
+              # **書かない**——piステップが完走したときにそちらが書く。
+              print(f"::warning::glmが中断したためpiへエスカレーションします: {result['abort_reason']}")
+              # 追記モードで開く（"w" では resolve_engine ステップが書いた分類結果の行を
+              # 消してしまう）。このファイルはPR本文構築ステップがそのまま cat する。
+              with open(os.path.join(runner_temp, "engine_resolution.txt"), "a", encoding="utf-8") as f:
+                  f.write(
+                      "glm のエージェントループが中断したため、同一ジョブ内で `pi` に"
+                      f"エスカレーションしました（glmの中断理由: {result['abort_reason']}）\n"
+                  )
+              sys.exit(0)
 
           with open(os.path.join(runner_temp, "commit_msg.txt"), encoding="utf-8") as f:
               base_commit_msg = f.read()
@@ -261,7 +300,11 @@ jobs:
           PYEOF
 
       - name: pi ハーネスで修正・検証・書き込みを行う
-        if: steps.resolve_engine.outputs.engine == 'pi'
+        # 第2項がエスカレーション条項。engineが`pi`ならglmステップはスキップされ
+        # `steps.run_glm.outputs.aborted` は空文字列になるが、その場合は第1項だけで
+        # 真になる（従来どおり）。engineが`glm`なら第1項は偽で、glmが完走したときは
+        # `'false'`、中断したときだけ `'true'` になってこのステップが走る。
+        if: steps.resolve_engine.outputs.engine == 'pi' || steps.run_glm.outputs.aborted == 'true'
         # _trusted/ はこのワークスペース内のサブディレクトリ（mainからのcheckout、上の
         # ".git/info/exclude" 登録でこのブランチからは追跡されない）。autofixの
         # $RUNNER_TEMP/trusted とは配置が異なるが、どちらも「mainからのcheckout」である
@@ -272,14 +315,16 @@ jobs:
           # 混入し、glm分岐とバイト単位で食い違う）。
           trailer=$'AI-generated (pi harness, OpenRouter GLM 5.3), needs review.\nRefs #'"$ISSUE_NUMBER"
           # 実測の経緯（issue #101への2回の再試行、いずれもpi分岐のみ）：
-          #   1回目（既定15/40、glmの現行ライブ値と同一）→ ツール呼び出し上限(40)到達
+          #   1回目（run_agent_loopの既定15/40。当時のglm分岐と同一値。glm分岐は
+          #     その後500/500へ引き上げた）→ ツール呼び出し上限(40)到達
           #   2回目（25/60）→ 呼び出しは43/60で余裕があったが、応答ターン上限(25)に到達
           #     （niriのKDL bind構文に確信が持てず、home/ai/tmp-probe.kdlへの
           #     write_file→niri validateの試行錯誤を繰り返していた）
           # ユーザーの指示により、pi分岐のみターン/呼び出し上限を実質無制限にして
           # 「予算さえあれば完走できるのか」を確認する。実際の歯止めは上限値ではなく
-          # ジョブの`timeout-minutes: 40`（このファイル先頭のjob定義）であり、
-          # それに達すればGitHub Actions側が強制終了する。glm分岐は15/40のまま変更しない。
+          # ジョブの`timeout-minutes: 90`（このファイル先頭のjob定義）であり、
+          # それに達すればGitHub Actions側が強制終了する（glmからのエスカレーションを
+          # 直列で収容するため40分から90分に引き上げてある）。
           export PI_MAX_TURNS=100000
           export PI_MAX_TOOL_CALLS=100000
           "$GITHUB_WORKSPACE/_trusted/.github/scripts/pi_run.sh" \

@@ -18,6 +18,7 @@ one-way: ai_pipeline.py must never import this module.
 """
 import json
 import os
+import re
 import urllib.request
 
 from ai_pipeline import (  # noqa: F401  (re-exported for existing callers)
@@ -55,6 +56,29 @@ _VERDICT_STRIP_CHARS = ".`\"'*。 "
 # 分類器が返しうる既知の応答。どちらとも一致しない応答（空応答・未知の文字列・
 # 切り詰め）は呼び出し元が `::warning::` で可視化する。
 _RECOGNIZED_VERDICTS = ("complex", "simple")
+
+# issue本文中の「バッククォートで囲まれたファイルパス」を拾う。このリポジトリのissueは
+# `modules/ai/bottle.nix` のようにパスを必ずバッククォートで囲んで書く（issue #102の
+# 本文がその実例）。拡張子（`\.\w+`）を必須にしているのは、`grep -rn` のようなコマンド片や
+# `simple` のような単語を拾わないため。文字クラスを `[\w./-]` に閉じていることは
+# プロンプト注入対策も兼ねる——抽出結果は分類プロンプトへそのまま埋め込まれるが、
+# 改行もバッククォートもこのクラスを通過できない。
+_PATH_MENTION_RE = re.compile(r"`([\w./-]+\.\w+)`")
+
+
+def extract_path_mentions(text):
+    """Return the distinct backtick-quoted file paths mentioned in `text`.
+
+    Order is first-appearance order, so an injected hint reads in the same order
+    as the issue body. Used only to give the classifier a countable fact; it is
+    never used to decide what the agent may touch (that is the allow-list's job).
+    """
+    found = []
+    for path in _PATH_MENTION_RE.findall(text or ""):
+        if path not in found:
+            found.append(path)
+    return found
+
 
 TOOL_DEFINITIONS = [
     {
@@ -247,14 +271,36 @@ def resolve_engine(configured, title, body, labels=(), *, request_fn=None):
             }
 
     request_fn = request_fn or _openrouter_request
+    safe_title = sanitize_text(title, max_len=300)
+    safe_body = sanitize_text(body, max_len=4000)
+
+    # 名指しされたファイルパスの件数を「数えられる事実」としてuser messageに注入する。
+    # systemプロンプトの文言は変えない——issue #102（`modules/ai/bottle.nix`,
+    # `home/ai/niri-config.kdl`, `home/ai/noctalia-settings.toml` の削除。3ファイル・
+    # 2ディレクトリ）が simple と誤分類されたのは、既存のルール（複数ファイルなら
+    # complex）が足りなかったからではなく、軽量モデルが自分のルールを守らなかったから。
+    # 抽出はモデルが実際に読むサニタイズ後のテキストに対して行う（切り詰めで本文から
+    # 消えたパスを件数に数えないため）。0〜1件なら行を足さない——issue #92/#93のように
+    # パスを名指ししないissueに対しては完全なno-opで、既存プロンプトと同一になる。
+    paths = extract_path_mentions(f"{safe_title}\n{safe_body}")
+    path_hint = ""
+    if len(paths) >= 2:
+        path_hint = (
+            f"このissueの本文は {len(paths)} 個の異なるファイルパスに言及しています: "
+            f"{', '.join(paths)}。\n"
+            "2つ以上のファイルまたはディレクトリに触れる作業は、上記のルールのとおり"
+            "通常 complex と判定してください。\n"
+        )
+
     classify_prompt = (
         "次のNixOS設定リポジトリのissueに対応する作業の複雑性を判定してください。\n"
         "単一ファイルの自明な追加・削除なら simple、複数ファイルの調査や"
         "試行錯誤を伴うなら complex です。\n"
+        f"{path_hint}"
         "simple か complex のどちらか一語だけを出力してください（引用符・"
         "コードブロック・句読点・説明は付けないでください）。\n\n"
-        f"--- タイトル ---\n{sanitize_text(title, max_len=300)}\n\n"
-        f"--- 本文 ---\n{sanitize_text(body, max_len=4000)}\n"
+        f"--- タイトル ---\n{safe_title}\n\n"
+        f"--- 本文 ---\n{safe_body}\n"
     )
 
     try:
@@ -287,7 +333,7 @@ def resolve_engine(configured, title, body, labels=(), *, request_fn=None):
     except (KeyError, IndexError, TypeError, OSError, ValueError) as error:
         # 失敗時は必ず glm にフォールバックする（pi ではない）。pi分岐は
         # PI_MAX_TURNS/PI_MAX_TOOL_CALLS を実質無制限にし、job の
-        # `timeout-minutes: 40` だけが歯止めになっているため、分類が不安定なときに
+        # `timeout-minutes: 90` だけが歯止めになっているため、分類が不安定なときに
         # 予算無制限側へ倒すのは既存の安全設計と矛盾する。`except Exception` には
         # しない（本当のバグを握り潰すため）が、この`try`ブロックは`request_fn`の
         # 実HTTP呼び出しを含むため、ネットワーク障害（urllibの`OSError`系）と
