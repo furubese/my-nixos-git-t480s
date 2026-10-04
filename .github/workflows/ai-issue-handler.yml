@@ -205,13 +205,17 @@ jobs:
           # 分けると、継続行のインデントがそのまま文字列内の余分な空白として
           # 混入し、glm分岐とバイト単位で食い違う）。
           trailer=$'AI-generated (pi harness, OpenRouter GLM 5.3), needs review.\nRefs #'"$ISSUE_NUMBER"
-          # 実測（issue #101, run 37170780678）：既定値（glmの現行ライブ値15/40と同一）では
-          # niri/noctalia見直しのような複数ファイル調査タスクでglmと全く同じ故障モード
-          # （ツール呼び出し上限到達、submit未呼び出し）を再現した。ユーザーの指示により、
-          # pi分岐のみ一時的に上限を上げて再テストする（glm分岐は15/40のまま変更しない——
-          # ハーネスの差ではなく予算の差を見る比較になるため、結果は参考値として扱うこと）。
-          export PI_MAX_TURNS=25
-          export PI_MAX_TOOL_CALLS=60
+          # 実測の経緯（issue #101への2回の再試行、いずれもpi分岐のみ）：
+          #   1回目（既定15/40、glmの現行ライブ値と同一）→ ツール呼び出し上限(40)到達
+          #   2回目（25/60）→ 呼び出しは43/60で余裕があったが、応答ターン上限(25)に到達
+          #     （niriのKDL bind構文に確信が持てず、home/ai/tmp-probe.kdlへの
+          #     write_file→niri validateの試行錯誤を繰り返していた）
+          # ユーザーの指示により、pi分岐のみターン/呼び出し上限を実質無制限にして
+          # 「予算さえあれば完走できるのか」を確認する。実際の歯止めは上限値ではなく
+          # ジョブの`timeout-minutes: 40`（このファイル先頭のjob定義）であり、
+          # それに達すればGitHub Actions側が強制終了する。glm分岐は15/40のまま変更しない。
+          export PI_MAX_TURNS=100000
+          export PI_MAX_TOOL_CALLS=100000
           "$GITHUB_WORKSPACE/_trusted/.github/scripts/pi_run.sh" \
             --repo-root "$GITHUB_WORKSPACE" \
             --runner-temp "$RUNNER_TEMP" \
