@@ -1,0 +1,113 @@
+name: pi cache warm
+
+# 目的: `pi` ハーネス（.github/scripts/pi_run.sh の PI_REF でピンした flake）の
+# ビルド成果物を Cachix（nixos-furubese-t480s-5gb）へ **書き込み権限つきで** push する、
+# AI を一切含まない信頼済みワークフロー。
+#
+# 背景（既知のギャップの解消）:
+# - ai-issue-handler.yml / ai-issue-autofix.yml の pi 分岐は cachix-action に authToken を
+#   渡さない＝読み取り専用で動いている（AI生成コードのビルド成果物をキャッシュへ
+#   書き込ませないための意図的な制限。check-light.yml のAIブランチ側と同じ扱い）。
+#   そのため「読む側」しか存在せず、piの依存クロージャ（.omc/research/pi-harness-spike.md
+#   の実測で274 derivation）を毎回ソースからビルドしていた。
+#   このワークフローが「書く側」を担う。
+# - AI関連のシークレットは一切不要。必要なのは CACHIX_AUTH_TOKEN のみ。
+#   `nix run "$PI_REF" -- --help` は、Nixが exec 前に必ず依存クロージャ全体を realize する
+#   性質を使ってビルドだけを強制し、`--help` によって pi 自身は OPENROUTER_API_KEY を
+#   読む前・モデルプロバイダへ到達する前に終了する（spike文書で `nix run
+#   github:earendil-works/pi/stable -- --help` が鍵なしで exit 0 と実測済み）。
+#   このファイルに OPENROUTER_API_KEY を追加しないこと。
+# - permissions は contents: read のみ。チェックアウト以外にリポジトリへ触らない。
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/scripts/pi_run.sh']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-cache-warm
+  # cancel-in-progress: false（固定）。true だと、PI_REF変更コミットの実行中に
+  # 無関係な変更が後続pushされた場合、前者がキャンセルされ、後者のガードは
+  # 「PI_REF行は不変」と正しく判定してスキップする——結果、新しいPI_REFが
+  # エラーも出さずに一度もビルド・pushされない静かな失敗経路になる。
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    # workflow_dispatch は任意refに対して起動できてしまうため、CACHIX_AUTH_TOKEN
+    # （書き込み権限）を持つこのジョブを main 以外のrefに対して実行させない。
+    # push トリガーは on.push.branches: [main] で既に main に限定されているため、
+    # このガードは workflow_dispatch のみに実質的な制限を課す。
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # ガードで github.event.before との diff を取るため全履歴が必要
+          # （既定の fetch-depth: 1 では before の commit が手元に無い）。
+          fetch-depth: 0
+
+      # paths: フィルタはファイル単位しか見ないため、pi_run.sh のコメント修正など
+      # PI_REF 以外の変更でも起動してしまう。ここで「PI_REF= の行自体が変わったか」を
+      # 判定する。判断がつかないケース（手動実行、新規ブランチ、before が祖先でない
+      # force-push、git diff 自体の失敗）は必ず build 側に倒す——既にキャッシュ済みの
+      # derivation を push するのは安価な no-op だが、誤って skip するとエラーも出ずに
+      # キャッシュが古いまま放置されるため。
+      - name: PI_REF行が変わったか判定
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          should_build=true
+          if [ "$EVENT_NAME" = "push" ] \
+            && [ -n "$BEFORE_SHA" ] \
+            && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            # `git diff` の終了ステータスは「diffが取れたか」だけを表す（差分の有無に
+            # よらず0、ref解決不能など本当のエラーでのみ非0）。grepをパイプで繋いで
+            # しまうと「PI_REF行が変わっていない」場合にifが偽になり、should_build=false
+            # を設定する分岐そのものが実行されない（=誤ってビルドしてしまう）。
+            # そのため「diffが成功したか」と「diff中にPI_REF行があるか」を分けて見る。
+            if diff_output="$(git diff "$BEFORE_SHA" "$AFTER_SHA" -- .github/scripts/pi_run.sh)"; then
+              if ! printf '%s\n' "$diff_output" | grep -q '^[+-]PI_REF='; then
+                should_build=false
+                echo "pi_run.sh は変更されたが PI_REF 行は不変。ビルドをスキップする。"
+              fi
+            else
+              echo "::notice::git diff に失敗した（force-push等）。安全側に倒してビルドする。"
+            fi
+          fi
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build"
+
+      - uses: cachix/install-nix-action@v27
+        if: steps.guard.outputs.should_build == 'true'
+
+      - name: Cachixへプッシュ（書き込み権限つき）
+        if: steps.guard.outputs.should_build == 'true'
+        uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: piをビルド（--helpで依存クロージャだけを実体化）
+        if: steps.guard.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          pi_ref="$(grep -oP '(?<=^PI_REF=")[^"]+' .github/scripts/pi_run.sh || true)"
+          if [ -z "$pi_ref" ]; then
+            echo "::error::pi_run.sh から PI_REF を抽出できなかった" >&2
+            exit 1
+          fi
+          echo "PI_REF=$pi_ref"
+          # Nixは exec 前に必ずクロージャ全体を realize するので、`--help` でも
+          # ビルドは完全に走る。pi自身は鍵を読む前に終了する。
+          nix run "$pi_ref" -- --help

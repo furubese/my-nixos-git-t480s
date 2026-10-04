@@ -75,20 +75,27 @@ jobs:
       - name: 作業ブランチをmainから作成（既存でも強制的にリセット）
         run: git checkout -B "$BRANCH"
 
-      - name: "Issueのタイトル・本文を取得（issues:labeled: イベントペイロードから$RUNNER_TEMPへ書き出し）"
+      - name: "Issueのタイトル・本文・ラベルを取得（issues:labeled: イベントペイロードから$RUNNER_TEMPへ書き出し）"
         if: github.event_name != 'workflow_dispatch'
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          # ラベル名も信頼できない入力と同じ扱いにする（step-level env: 経由で受け取り、
+          # `run:` に直接埋め込まない）。JSON配列で受けてjqで1行1件に展開するのは、
+          # expression の join() が区切り文字に改行を取れず、ラベル名にはカンマも
+          # 含まれうるため。
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
           printf '%s' "$ISSUE_TITLE" > "$RUNNER_TEMP/issue_title.txt"
           printf '%s' "$ISSUE_BODY" > "$RUNNER_TEMP/issue_body.txt"
+          printf '%s' "$ISSUE_LABELS_JSON" | jq -r '.[]?' > "$RUNNER_TEMP/issue_labels.txt"
 
-      - name: "Issueのタイトル・本文を取得（workflow_dispatch: GitHub APIから取得し$RUNNER_TEMPへ書き出し）"
+      - name: "Issueのタイトル・本文・ラベルを取得（workflow_dispatch: GitHub APIから取得し$RUNNER_TEMPへ書き出し）"
         if: github.event_name == 'workflow_dispatch'
         run: |
           gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.title' > "$RUNNER_TEMP/issue_title.txt"
           gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.body // ""' > "$RUNNER_TEMP/issue_body.txt"
+          gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.labels[].name' > "$RUNNER_TEMP/issue_labels.txt"
 
       - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
         run: echo '_trusted/' >> .git/info/exclude
@@ -97,10 +104,69 @@ jobs:
         uses: actions/checkout@v4
         with: { ref: main, path: _trusted, persist-credentials: false }
 
+      - name: 使用エンジンを解決（明示指定 → ラベル → issueの複雑性の自動分類）
+        id: resolve_engine
+        # `if:` は付けない（常に実行する）。スキップされたステップの outputs は空文字列に
+        # なるため（`steps.<id>.outputs.<x>` == ''）、条件を付けると下流3箇所の
+        # `steps.resolve_engine.outputs.engine` 比較が全て壊れる。
+        # job-level `env:`（このファイルのL58-63）はジョブ開始時に一度だけ評価されるので
+        # `steps.*.outputs.*` を参照できない。解決結果はstep-levelでのみ参照する。
+        env:
+          HANDLER_ENGINE_VAR: ${{ vars.AI_HANDLER_ENGINE }}
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import sys
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import glm_agent  # noqa: E402
+
+          # 分類・ショートサーキット・ラベル上書き・例外時fallbackの全ロジックは
+          # glm_agent.resolve_engine() 側にあり、test_glm_agent.py の反例テーブルで
+          # 検証されている。ここに判定ロジックを書き戻さないこと（heredoc内のコードは
+          # テストできないため、安全装置がここに残ると検証されないまま腐る）。
+          runner_temp = os.environ["RUNNER_TEMP"]
+
+
+          def read(name):
+              with open(os.path.join(runner_temp, name), encoding="utf-8") as f:
+                  return f.read()
+
+
+          # sanitize_text は resolve_engine 内で呼ばれる。「初回メッセージを構築」
+          # ステップのサニタイズとは独立（あちらは両分岐が共有するため触らない）。
+          result = glm_agent.resolve_engine(
+              os.environ.get("HANDLER_ENGINE_VAR", ""),
+              read("issue_title.txt"),
+              read("issue_body.txt"),
+              labels=tuple(line.strip() for line in read("issue_labels.txt").splitlines() if line.strip()),
+              request_fn=None,
+          )
+          engine = result["engine"]
+          reason = result["reason"]
+
+          print(f"::notice::engine={engine} / {reason}")
+          if not result["verdict_recognized"]:
+              # 自動分類が simple/complex のどちらとも一致しなかった（空応答・未知の
+              # 文字列・例外）。安全側の glm に解決済みだが、無警告で auto が常時 glm に
+              # 縮退し続ける状態を検知できるようにここで必ず警告を出す。
+              print(f"::warning::自動分類の応答が simple/complex と一致しませんでした: {reason}")
+
+          # このファイルは後続のPR本文構築ステップが無条件に cat する（このステップも
+          # 無条件実行なので常に存在する）。
+          with open(os.path.join(runner_temp, "engine_resolution.txt"), "w", encoding="utf-8") as f:
+              f.write(f"使用エンジン: `{engine}`（{reason}）\n")
+
+          # GITHUB_OUTPUT には engine だけを書く（reason は改行や `=` を含みうるため
+          # key=value 形式に流し込めない）。
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"engine={engine}\n")
+          PYEOF
+
       - uses: cachix/install-nix-action@v27
 
       - name: Cachix（piのビルド用、読み取りのみ・pushなし）
-        if: vars.AI_HANDLER_ENGINE == 'pi'
+        if: steps.resolve_engine.outputs.engine == 'pi'
         uses: cachix/cachix-action@v15
         with:
           name: nixos-furubese-t480s-5gb
@@ -165,7 +231,7 @@ jobs:
           PYEOF
 
       - name: GLMエージェントループを実行し、許可パスへ書き込む
-        if: vars.AI_HANDLER_ENGINE != 'pi'
+        if: steps.resolve_engine.outputs.engine != 'pi'
         run: |
           python3 <<'PYEOF'
           import os
@@ -195,7 +261,7 @@ jobs:
           PYEOF
 
       - name: pi ハーネスで修正・検証・書き込みを行う
-        if: vars.AI_HANDLER_ENGINE == 'pi'
+        if: steps.resolve_engine.outputs.engine == 'pi'
         # _trusted/ はこのワークスペース内のサブディレクトリ（mainからのcheckout、上の
         # ".git/info/exclude" 登録でこのブランチからは追跡されない）。autofixの
         # $RUNNER_TEMP/trusted とは配置が異なるが、どちらも「mainからのcheckout」である
@@ -284,6 +350,8 @@ jobs:
             echo
             echo "---"
             echo "issue #${ISSUE_NUMBER} からAI（OpenRouter経由のGLM 5.3）が自動生成した変更です。"
+            # resolve_engine は無条件実行なのでこのファイルは常に存在する（`if:` 不要）。
+            cat "$RUNNER_TEMP/engine_resolution.txt"
             echo "AIはNixコードを直接生成しています。書き込み先パスは modules/ai/**, home/ai/**,"
             echo "tests/ai/** の直下に機械的に制限されていますが、これは能力のサンドボックスでは"
             echo "ありません。**マージ前に必ず全差分を人間がレビューしてください。**"
