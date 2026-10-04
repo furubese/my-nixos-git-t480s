@@ -11,3 +11,9 @@ age-key*
 
 # Deep Interview / planning artifacts: not part of the NixOS config, kept local only
 .omc/
+
+# このリポジトリは意図的にflake.lockをコミットしない方針。`nix eval "."`等、
+# "."をflakeとして評価するコマンドは副作用でこれを生成しうる（AIエージェントの
+# run_commandがnix eval ".#..."を実行した際に実際に発生・check-diffに拒否された
+# 実例あり）。生成されても常にgit側で無視されるようにする。
+flake.lock
