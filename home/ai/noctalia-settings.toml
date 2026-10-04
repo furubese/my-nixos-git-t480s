@@ -1,7 +1,0 @@
-# 【重複解消（PRレビュー指摘）】
-#
-# 既存リポジトリの人間管理ファイル home/noctalia-settings.toml と内容が重複するため、
-# このファイルの設定は削除した。
-# noctalia の設定本体は home/noctalia-settings.toml（home/noctalia.nix から配備）を
-# 参照すること。
-# home/ai/noctalia.nix もこのファイルへの参照をやめたため、どこからも使用されない。

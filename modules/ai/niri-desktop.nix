@@ -1,14 +1,18 @@
-# niri + noctalia デスクトップ環境 (issue #76)
+# niri + noctalia デスクトップ環境 (issue #76, #101)
 # 普段使いの Fedora (niri + noctalia) 環境に寄せた構成。
 # - niri本体とWaylandセッションは programs.niri.enable が提供
 # - ログインは greetd + tuigreet (issue #17 の構成を維持)
 # - noctalia は niri設定 (home/ai/niri.kdl) の spawn-at-startup から起動
+# - noctalia本体のインストールは modules/ai/noctalia.nix が担当
+#   (nixpkgsにパッケージが無い場合に警告だけ出す作りのため、ここでは
+#   二重に追加しない)
 # - niri / noctalia の設定ファイル本体は home/ai/niri.nix, home/ai/noctalia.nix がデプロイ
 { pkgs, ... }:
 
 let
   # カーソルテーマ (niri.kdl の cursor.xcursor-theme で参照)。
-  # nixpkgs に catppuccin-cursors があれば frappe-green 相当のバリアントを導入。
+  # nixpkgs の catppuccin-cursors は出力(output)ごとにフレーバーが分かれており、
+  # frappeGreen 出力がテーマ「catppuccin-frappe-green-cursors」を提供する。
   # なければスキップする (存在チェックによりビルドは壊さない)。
   catppuccinCursors =
     if (pkgs ? catppuccin-cursors) && (pkgs.catppuccin-cursors ? frappeGreen)
@@ -60,9 +64,10 @@ in
   ];
 
   environment.systemPackages = with pkgs; [
-    noctalia # デスクトップシェル (niri.kdl から起動)
+    # 注: noctalia本体は modules/ai/noctalia.nix がシステムプロファイルに入れる
+    # (niri.kdl の spawn-at-startup "noctalia" から参照される)
     alacritty # ターミナル (niri.kdl の Mod+T)
-    firefox # ドックにpinするブラウザ
+    firefox # ドックにpinするブラウザ (home/ai/noctalia.toml の dock.pinned)
     brightnessctl # 輝度キー (niri.kdl のbinds)
     playerctl # メディアキー (同上)
     wireplumber # wpctl (音量キー)
