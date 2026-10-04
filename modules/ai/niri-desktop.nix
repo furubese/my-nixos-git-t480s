@@ -28,7 +28,7 @@ in
   services.greetd = {
     enable = true;
     settings.default_session.command =
-      "${pkgs.tuigreet-definitely-not-a-real-package-xyz}/bin/tuigreet --time --remember --cmd ${pkgs.niri}/bin/niri";
+      "${pkgs.tuigreet}/bin/tuigreet --time --remember --cmd ${pkgs.niri}/bin/niri";
   };
 
   # 音声: PipeWire + WirePlumber (wpctl のバックエンド)
