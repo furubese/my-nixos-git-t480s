@@ -1,0 +1,29 @@
+# noctaliaシェル設定 (issue #76 → issue #101)
+# home/ai/noctalia.nix から ~/.config/noctalia/config.toml として配置される。
+# 現行noctalia (5.x) は ~/.config/noctalia/ 配下の *.toml のみを読むため、
+# 旧JSON(config.json)からTOMLへ移行した。
+# なおGUIで変更した設定は ~/.local/state/noctalia/settings.toml に保存され、
+# このファイルより優先される。
+
+# バー (名前付きサブテーブル。1本だけなら order 指定は不要)
+[bar.main]
+position = "left"
+
+# ドック
+[dock]
+enabled = true
+position = "left"
+icon_size = 47
+pinned = ["firefox"]
+smart_auto_hide = true
+
+# テーマ: コミュニティパレット (Catppuccin Macchiato Rosewater) を使う
+[theme]
+mode = "auto"
+source = "community"
+community_palette = "Catppuccin Macchiato Rosewater"
+# wallpaper_scheme = "muted"  # source = "wallpaper" の場合のみ有効なためコメント化
+
+# ポリキーエージェント (modules/ai/niri-desktop.nix の security.polkit と対応)
+[shell]
+polkit_agent = true

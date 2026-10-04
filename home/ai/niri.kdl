@@ -1,4 +1,6 @@
 // niri設定 (issue #76: 普段使いの Fedora, niri + noctalia 環境に寄せる)
+// issue #101: niri 26.04 のアクション名・キー名に合わせて修正
+//   (quit / show-hotkey-overlay / Page_Down・Page_Up / Mod+WheelScrollDown 等)
 // home/ai/niri.nix から ~/.config/niri/config.kdl として配置される。
 
 input {
@@ -38,12 +40,13 @@ clipboard {
 screenshot-path "~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png"
 
 // noctalia デスクトップシェルを起動。
-// アセット(壁紙等)は ~/.local/share/noctalia-assets に配置する。
-spawn-at-startup "/bin/sh" "-c" "NOCTALIA_ASSETS_DIR=$HOME/.local/share/noctalia-assets noctalia"
+// アセット(emoji・フォント・テンプレート等)はパッケージ側に同梱されているため、
+// NOCTALIA_ASSETS_DIR による差し替えは行わない (issue #101 で spawn コマンドを簡素化)。
+spawn-at-startup "noctalia"
 
 binds {
     // ホットキー一覧オーバーレイ
-    Mod+Shift+Slash { show-hotkeys-overlay; }
+    Mod+Shift+Slash { show-hotkey-overlay; }
 
     // ターミナル
     Mod+T { spawn "alacritty"; }
@@ -54,13 +57,13 @@ binds {
     // Mod+S: コントロールセンター
     Mod+S { spawn "noctalia" "msg" "panel-toggle" "control-center"; }
     // Super+O (Mod は Super の別名): overview + ランチャー
-    Mod+O { spawn "/bin/sh" "-c" "niri msg action toggle-overview && noctalia msg launcher toggle"; }
+    Mod+O { spawn "/bin/sh" "-c" "niri msg action toggle-overview && noctalia msg panel-toggle launcher"; }
 
     // モニター電源オフ
     Mod+Shift+P { power-off-monitors; }
 
     // niri終了
-    Mod+Shift+E { exit; }
+    Mod+Shift+E { quit; }
 
     // スクリーンショット
     Print { screenshot-screen; }
@@ -119,12 +122,12 @@ binds {
     Mod+Shift+End { move-column-to-last; }
 
     // ---- ワークスペース ----
-    Mod+WheelScrollDown* { focus-workspace-down; }
-    Mod+WheelScrollUp* { focus-workspace-up; }
-    Mod+PageDown { focus-workspace-down; }
-    Mod+PageUp { focus-workspace-up; }
-    Mod+Shift+PageDown { move-column-to-workspace-down; }
-    Mod+Shift+PageUp { move-column-to-workspace-up; }
+    Mod+WheelScrollDown { focus-workspace-down; }
+    Mod+WheelScrollUp { focus-workspace-up; }
+    Mod+Page_Down { focus-workspace-down; }
+    Mod+Page_Up { focus-workspace-up; }
+    Mod+Shift+Page_Down { move-column-to-workspace-down; }
+    Mod+Shift+Page_Up { move-column-to-workspace-up; }
     Mod+1 { focus-workspace 1; }
     Mod+2 { focus-workspace 2; }
     Mod+3 { focus-workspace 3; }
