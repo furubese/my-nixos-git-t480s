@@ -36,11 +36,25 @@ from ai_pipeline import (  # noqa: F401  (re-exported for existing callers)
     _run_env,
     _truncate,
     _write_outputs,
+    sanitize_text,
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "z-ai/glm-5.3"
 REQUEST_TIMEOUT = 120
+
+# 複雑性分類専用の軽量モデル。本番のエージェントループ（MODEL）とは別物で、
+# 「simple か complex の一語」だけを返させる。
+CLASSIFIER_MODEL = "z-ai/glm-5.3-flash"
+
+# verdictの正規化で文字列の**両端からのみ**除去する文字。`?` と `!` は意図的に
+# 含めない——`"complex?"` のようなヘッジ応答を確信ありの完全一致に変えてしまい、
+# 「complexと確定できなければglmへfail-safe」という原則に反するため。
+_VERDICT_STRIP_CHARS = ".`\"'*。 "
+
+# 分類器が返しうる既知の応答。どちらとも一致しない応答（空応答・未知の文字列・
+# 切り詰め）は呼び出し元が `::warning::` で可視化する。
+_RECOGNIZED_VERDICTS = ("complex", "simple")
 
 TOOL_DEFINITIONS = [
     {
@@ -170,6 +184,140 @@ def _openrouter_request(payload):
     )
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
         return json.load(response)
+
+
+def resolve_engine(configured, title, body, labels=(), *, request_fn=None):
+    """Pick the engine (glm or pi) that handles one issue.
+
+    Precedence, highest first:
+
+    1. `configured in ("glm", "pi")` — an explicit vars.AI_HANDLER_ENGINE wins
+       unconditionally and makes **zero** network calls. This path must stay
+       behaviourally identical to the pre-auto-selection handler.
+    2. a `complex-request` / `simple-request` label on the issue. A label
+       *replaces* the classification call (it never overrides 1.). Both labels
+       at once resolves as `simple-request`: erring toward the bounded engine is
+       the safe direction.
+    3. the CLASSIFIER_MODEL verdict, which must normalize to exactly "complex"
+       to select pi. Everything else lands on glm: "complexity", "complexity:
+       low", "complexではない", "complex?", "「complex」", an empty answer, a
+       truncated answer (finish_reason not in (None, "stop")), or one of the
+       narrow exceptions below. Only the one known-good answer passes, which is
+       what closes the open world a negation blocklist cannot close — the
+       normalization strips from the string's two ends only, so a single
+       unexpected character anywhere in the middle means no match, i.e. glm.
+       The cost is recall: a verdict that *means* complex but carries quotes,
+       a code fence or a prefix resolves to glm. That is intended, not a bug.
+
+    `title` and `body` are untrusted issue text and are sanitized here. This is
+    deliberately independent of the handler's own sanitize_text() call for the
+    agent loop's initial message (both engines share that one; it is untouched).
+
+    Returns {"engine", "verdict", "reason", "verdict_recognized"}.
+    `verdict_recognized` is False only on the classification path, when the
+    normalized verdict is neither "complex" nor "simple" (so the caller can
+    emit `::warning::` instead of letting `auto` degrade to a permanent silent
+    glm). The explicit and label paths never set it False: there is no verdict.
+    """
+    configured = (configured or "").strip()
+    if configured in ("glm", "pi"):
+        return {
+            "engine": configured,
+            "verdict": None,
+            "reason": f"vars.AI_HANDLER_ENGINE={configured} の明示指定（自動分類なし）",
+            "verdict_recognized": True,
+        }
+
+    labels = tuple(labels or ())
+    if "simple-request" in labels and "complex-request" in labels:
+        return {
+            "engine": "glm",
+            "verdict": None,
+            "reason": "simple-request と complex-request が同時に付与されているため"
+            "有界側の simple-request を優先（自動分類なし）",
+            "verdict_recognized": True,
+        }
+    for label, engine in (("simple-request", "glm"), ("complex-request", "pi")):
+        if label in labels:
+            return {
+                "engine": engine,
+                "verdict": None,
+                "reason": f"{label} ラベルによる指定（自動分類なし）",
+                "verdict_recognized": True,
+            }
+
+    request_fn = request_fn or _openrouter_request
+    classify_prompt = (
+        "次のNixOS設定リポジトリのissueに対応する作業の複雑性を判定してください。\n"
+        "単一ファイルの自明な追加・削除なら simple、複数ファイルの調査や"
+        "試行錯誤を伴うなら complex です。\n"
+        "simple か complex のどちらか一語だけを出力してください（引用符・"
+        "コードブロック・句読点・説明は付けないでください）。\n\n"
+        f"--- タイトル ---\n{sanitize_text(title, max_len=300)}\n\n"
+        f"--- 本文 ---\n{sanitize_text(body, max_len=4000)}\n"
+    )
+
+    try:
+        # HTTP呼び出しは既存ヘルパをそのまま再利用する（urllibの再実装はしない）。
+        # _openrouter_request は環境から OPENROUTER_API_KEY を読む。`tools` キーは
+        # 不要。`max_tokens` は**付けない**——完全一致判定は切り詰め応答に対しても
+        # 安全側（glm）に落ちるので安全上の意義が無く、一方で reasoning token を
+        # 使うモデルで空応答を誘発し auto が無警告で常時 glm に縮退するリスクを
+        # 上げるだけになる。
+        response = request_fn(
+            {
+                "model": CLASSIFIER_MODEL,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "あなたは作業量の分類器です。simple か complex の一語のみを返します。",
+                    },
+                    {"role": "user", "content": classify_prompt},
+                ],
+            }
+        )
+        choice = response["choices"][0]
+        verdict = (choice["message"].get("content") or "").strip()
+        # finish_reason は content と違い choices[0] の直下にある。None は
+        # 「このフィールドを返さないプロバイダ」として許容する（欠落で auto 全体が
+        # 原因不明に glm へ固定されるのを避ける）。それ以外の非 "stop" 値だけを、
+        # 切り詰めが偶然 "complex" への一致を作る唯一の経路として弾く。
+        finish_reason = choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError, OSError, ValueError) as error:
+        # 失敗時は必ず glm にフォールバックする（pi ではない）。pi分岐は
+        # PI_MAX_TURNS/PI_MAX_TOOL_CALLS を実質無制限にし、job の
+        # `timeout-minutes: 40` だけが歯止めになっているため、分類が不安定なときに
+        # 予算無制限側へ倒すのは既存の安全設計と矛盾する。`except Exception` には
+        # しない（本当のバグを握り潰すため）が、この`try`ブロックは`request_fn`の
+        # 実HTTP呼び出しを含むため、ネットワーク障害（urllibの`OSError`系）と
+        # JSONデコード失敗（`ValueError`系、`json.JSONDecodeError`はその派生）も
+        # レスポンス構造の不整合（KeyError/IndexError/TypeError）と同じ「外部呼び出し
+        # の予期された失敗モード」として扱う必要がある——ここだけ狭めると、通信エラー
+        # 1つでフォールバックせずジョブそのものが落ちてしまう。
+        return {
+            "engine": "glm",
+            "verdict": None,
+            "reason": "自動分類が失敗したため安全側の glm にフォールバック: "
+            f"{type(error).__name__}: {error}",
+            "verdict_recognized": False,
+        }
+
+    normalized = verdict.strip().lower().strip(_VERDICT_STRIP_CHARS)
+    engine = "pi" if normalized == "complex" else "glm"
+    reason = f"{CLASSIFIER_MODEL} の自動分類結果: {verdict!r}"
+    if finish_reason not in (None, "stop"):
+        engine = "glm"
+        reason = (
+            f"{CLASSIFIER_MODEL} の応答が途中で終了したため（finish_reason="
+            f"{finish_reason!r}）安全側の glm にフォールバック: {verdict!r}"
+        )
+    return {
+        "engine": engine,
+        "verdict": verdict,
+        "reason": reason,
+        "verdict_recognized": normalized in _RECOGNIZED_VERDICTS,
+    }
 
 
 def run_agent_loop(

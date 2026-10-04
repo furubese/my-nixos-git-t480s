@@ -203,6 +203,27 @@ material for a written article about building it — see "Article log" below).
   alone means something different under `pull_request` vs. other triggers), so AI-generated
   build artifacts are never pushed to the cache, only read from it. Its `dispatch-autofix` job
   is split out from `build` specifically so only that one job needs `actions: write`.
+- **Engine selection ADR (`vars.AI_HANDLER_ENGINE`)**: `ai-issue-handler.yml` can run its agent
+  loop on either the `glm_agent.py` engine described above or a `pi`-based harness, chosen by
+  `vars.AI_HANDLER_ENGINE` (`glm` / `pi` / unset-or-`auto`). The non-negotiable rule: an
+  explicit `glm` or `pi` value always wins over everything else — label-based overrides and any
+  LLM auto-classification of the issue body only apply when the var is unset or `auto`. This was
+  a deliberate design decision (full alternatives considered live in
+  `.omc/plans/pi-handler-routing-cache-memory-consensus.md`'s ADR, not reproduced here since
+  `.omc/` is gitignored): an explicit admin-set repo variable must never be silently overridden
+  by a mechanism that carries less trust than the person who set it — a classifier or a label
+  is not allowed to second-guess a human's explicit configuration.
+- **Persistent memory (design policy only, not yet implemented)**: there's a future intent to
+  let the agent loop accumulate learned knowledge across runs (the loop otherwise starts from
+  zero every time, since it runs on a throwaway CI VM). If this is ever built, the knowledge
+  file must live trusted-side only (checked out from `main`, same as `glm_agent.py`/
+  `ai_pipeline.py` above) and must **never** sit inside the AI's write-allowed scope
+  (`modules/ai/**`/`home/ai/**`/`tests/ai/**`). Updates to it go through a normal
+  human-reviewed PR, never through the AI branch's sandboxed `write_file` tool. This asymmetry —
+  write access to code, no write access to the file that shapes its own future prompts — is the
+  same trust boundary already enforced above for `glm_agent.py`/`ai_pipeline.py`, extended from
+  code to accumulated knowledge: letting the AI branch edit its own memory would turn that memory
+  into a self-reinforcing, unreviewed feedback loop instead of a trusted record.
 
 ## Testing without a local Nix install
 

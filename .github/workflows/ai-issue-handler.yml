@@ -75,20 +75,27 @@ jobs:
       - name: 作業ブランチをmainから作成（既存でも強制的にリセット）
         run: git checkout -B "$BRANCH"
 
-      - name: "Issueのタイトル・本文を取得（issues:labeled: イベントペイロードから$RUNNER_TEMPへ書き出し）"
+      - name: "Issueのタイトル・本文・ラベルを取得（issues:labeled: イベントペイロードから$RUNNER_TEMPへ書き出し）"
         if: github.event_name != 'workflow_dispatch'
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          # ラベル名も信頼できない入力と同じ扱いにする（step-level env: 経由で受け取り、
+          # `run:` に直接埋め込まない）。JSON配列で受けてjqで1行1件に展開するのは、
+          # expression の join() が区切り文字に改行を取れず、ラベル名にはカンマも
+          # 含まれうるため。
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
           printf '%s' "$ISSUE_TITLE" > "$RUNNER_TEMP/issue_title.txt"
           printf '%s' "$ISSUE_BODY" > "$RUNNER_TEMP/issue_body.txt"
+          printf '%s' "$ISSUE_LABELS_JSON" | jq -r '.[]?' > "$RUNNER_TEMP/issue_labels.txt"
 
-      - name: "Issueのタイトル・本文を取得（workflow_dispatch: GitHub APIから取得し$RUNNER_TEMPへ書き出し）"
+      - name: "Issueのタイトル・本文・ラベルを取得（workflow_dispatch: GitHub APIから取得し$RUNNER_TEMPへ書き出し）"
         if: github.event_name == 'workflow_dispatch'
         run: |
           gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.title' > "$RUNNER_TEMP/issue_title.txt"
           gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.body // ""' > "$RUNNER_TEMP/issue_body.txt"
+          gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER" --jq '.labels[].name' > "$RUNNER_TEMP/issue_labels.txt"
 
       - name: 信頼済みスクリプトの取得前に_trusted/をgit管理から除外登録
         run: echo '_trusted/' >> .git/info/exclude
@@ -97,7 +104,7 @@ jobs:
         uses: actions/checkout@v4
         with: { ref: main, path: _trusted, persist-credentials: false }
 
-      - name: 使用エンジンを解決（明示指定が無ければissueの複雑性で自動選択）
+      - name: 使用エンジンを解決（明示指定 → ラベル → issueの複雑性の自動分類）
         id: resolve_engine
         # `if:` は付けない（常に実行する）。スキップされたステップの outputs は空文字列に
         # なるため（`steps.<id>.outputs.<x>` == ''）、条件を付けると下流3箇所の
@@ -112,70 +119,38 @@ jobs:
           import sys
 
           sys.path.insert(0, "_trusted/.github/scripts")
-          import ai_pipeline  # noqa: E402
           import glm_agent  # noqa: E402
 
-          # 分類用の軽量モデル。本番のエージェントループ（z-ai/glm-5.3）とは別物で、
-          # ここでは「simple/complex の一語」だけを返させる。
-          CLASSIFIER_MODEL = "z-ai/glm-5.3-flash"
-
+          # 分類・ショートサーキット・ラベル上書き・例外時fallbackの全ロジックは
+          # glm_agent.resolve_engine() 側にあり、test_glm_agent.py の反例テーブルで
+          # 検証されている。ここに判定ロジックを書き戻さないこと（heredoc内のコードは
+          # テストできないため、安全装置がここに残ると検証されないまま腐る）。
           runner_temp = os.environ["RUNNER_TEMP"]
-          configured = os.environ.get("HANDLER_ENGINE_VAR", "").strip()
 
-          if configured in ("glm", "pi"):
-              # 明示指定時は分類呼び出しを一切行わない（従来動作と完全に同一に保つ）。
-              engine = configured
-              reason = f"vars.AI_HANDLER_ENGINE={configured} の明示指定（自動分類なし）"
-          else:
-              # 未設定・auto・タイポはすべて自動分類に落とす。
-              with open(os.path.join(runner_temp, "issue_title.txt"), encoding="utf-8") as f:
-                  issue_title = ai_pipeline.sanitize_text(f.read(), max_len=300)
-              with open(os.path.join(runner_temp, "issue_body.txt"), encoding="utf-8") as f:
-                  issue_body = ai_pipeline.sanitize_text(f.read(), max_len=4000)
 
-              # 「初回メッセージを構築」ステップとは独立した専用のサニタイズ・呼び出し。
-              # sanitize_text が2回走るのは意図通り（あちらは両分岐が共有するため触らない）。
-              classify_prompt = (
-                  "次のNixOS設定リポジトリのissueに対応する作業の複雑性を判定してください。\n"
-                  "単一ファイルの自明な追加・削除なら simple、複数ファイルの調査や"
-                  "試行錯誤を伴うなら complex です。\n"
-                  "simple か complex のどちらか一語だけを出力してください。\n\n"
-                  f"--- タイトル ---\n{issue_title}\n\n"
-                  f"--- 本文 ---\n{issue_body}\n"
-              )
+          def read(name):
+              with open(os.path.join(runner_temp, name), encoding="utf-8") as f:
+                  return f.read()
 
-              try:
-                  # HTTP呼び出しは既存ヘルパをそのまま再利用する（urllibの再実装はしない）。
-                  # _openrouter_request は環境から OPENROUTER_API_KEY を読む。job-level env:
-                  # で既に渡っているのでこのステップでも追加設定は不要。`tools` キーは不要。
-                  response = glm_agent._openrouter_request(
-                      {
-                          "model": CLASSIFIER_MODEL,
-                          "temperature": 0,
-                          "messages": [
-                              {
-                                  "role": "system",
-                                  "content": "あなたは作業量の分類器です。simple か complex の一語のみを返します。",
-                              },
-                              {"role": "user", "content": classify_prompt},
-                          ],
-                      }
-                  )
-                  verdict = (response["choices"][0]["message"].get("content") or "").strip()
-                  # 完全一致ではなく部分一致で見る。flashモデルは句読点や短い説明を
-                  # 付けてくることがあり、その場合に完全一致だと常にglm側へ落ちてしまう。
-                  # "complex" が見つからなければ安全側の glm に解決する。
-                  engine = "pi" if "complex" in verdict.lower() else "glm"
-                  reason = f"{CLASSIFIER_MODEL} の自動分類結果: {verdict!r}"
-              except Exception as exc:  # noqa: BLE001
-                  # 失敗時は必ず glm にフォールバックする（pi ではない）。pi分岐は
-                  # PI_MAX_TURNS/PI_MAX_TOOL_CALLS を実質無制限にし、job の
-                  # `timeout-minutes: 40` だけが歯止めになっている。分類呼び出しが
-                  # 不安定なときに予算無制限側へ倒すのは既存の安全設計と矛盾する。
-                  engine = "glm"
-                  reason = f"自動分類が失敗したため安全側の glm にフォールバック: {type(exc).__name__}: {exc}"
+
+          # sanitize_text は resolve_engine 内で呼ばれる。「初回メッセージを構築」
+          # ステップのサニタイズとは独立（あちらは両分岐が共有するため触らない）。
+          result = glm_agent.resolve_engine(
+              os.environ.get("HANDLER_ENGINE_VAR", ""),
+              read("issue_title.txt"),
+              read("issue_body.txt"),
+              labels=tuple(line.strip() for line in read("issue_labels.txt").splitlines() if line.strip()),
+              request_fn=None,
+          )
+          engine = result["engine"]
+          reason = result["reason"]
 
           print(f"::notice::engine={engine} / {reason}")
+          if not result["verdict_recognized"]:
+              # 自動分類が simple/complex のどちらとも一致しなかった（空応答・未知の
+              # 文字列・例外）。安全側の glm に解決済みだが、無警告で auto が常時 glm に
+              # 縮退し続ける状態を検知できるようにここで必ず警告を出す。
+              print(f"::warning::自動分類の応答が simple/complex と一致しませんでした: {reason}")
 
           # このファイルは後続のPR本文構築ステップが無条件に cat する（このステップも
           # 無条件実行なので常に存在する）。

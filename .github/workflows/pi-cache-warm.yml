@@ -30,10 +30,19 @@ permissions:
 
 concurrency:
   group: pi-cache-warm
-  cancel-in-progress: true
+  # cancel-in-progress: false（固定）。true だと、PI_REF変更コミットの実行中に
+  # 無関係な変更が後続pushされた場合、前者がキャンセルされ、後者のガードは
+  # 「PI_REF行は不変」と正しく判定してスキップする——結果、新しいPI_REFが
+  # エラーも出さずに一度もビルド・pushされない静かな失敗経路になる。
+  cancel-in-progress: false
 
 jobs:
   warm:
+    # workflow_dispatch は任意refに対して起動できてしまうため、CACHIX_AUTH_TOKEN
+    # （書き込み権限）を持つこのジョブを main 以外のrefに対して実行させない。
+    # push トリガーは on.push.branches: [main] で既に main に限定されているため、
+    # このガードは workflow_dispatch のみに実質的な制限を課す。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -93,7 +102,7 @@ jobs:
         if: steps.guard.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          pi_ref="$(grep -oP '(?<=^PI_REF=")[^"]+' .github/scripts/pi_run.sh)"
+          pi_ref="$(grep -oP '(?<=^PI_REF=")[^"]+' .github/scripts/pi_run.sh || true)"
           if [ -z "$pi_ref" ]; then
             echo "::error::pi_run.sh から PI_REF を抽出できなかった" >&2
             exit 1
