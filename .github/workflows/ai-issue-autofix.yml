@@ -19,6 +19,11 @@ name: AI Issue Autofix
 #   このトレーラーを持つコミット数（origin/main..HEAD）で数える。外部の状態ストアは使わない。
 # - このジョブは vars.AI_PIPELINE_ENABLED（既存マスタースイッチ）に加え、
 #   vars.AI_AGENT_LOOP_AUTOFIX が 'true' の場合のみ動く（ANDで追加、段階的ロールアウト用）。
+# - エージェント本体は vars.AI_AUTOFIX_ENGINE で切り替える（未設定＝'glm'、'pi' で
+#   piハーネスのパイロット）。両分岐を常にmain上に共存させることで、ロールバックが
+#   変数の編集1つで完結する（.omc/plans/pi-harness-migration.md ステップ4）。
+#   どちらのエンジンでも、初回メッセージの構築・checkout・クレデンシャル確認・
+#   check-diff・push は分岐の外にある共通ステップをそのまま使う。
 on:
   workflow_dispatch:
     inputs:
@@ -49,6 +54,11 @@ jobs:
       BRANCH: ${{ inputs.branch }}
       RUN_ID: ${{ inputs.run_id }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # glm分岐・pi分岐の両方が参照する唯一の定義箇所。分岐ごとにリテラルを
+      # コピーすると、将来値を変えたときに試行回数カウンタ（上の「試行回数を確認」
+      # ステップのgrep）と食い違う。
+      AUTOFIX_TRAILER: "AI-Autofix-Attempt: true"
+      AUTOFIX_PREFIX: "autofix: "
     steps:
       - name: 信頼済みスクリプトをmainから取得（検証前に必須）
         uses: actions/checkout@v4
@@ -174,7 +184,7 @@ jobs:
         timeout-minutes: 5
         run: nix profile install --inputs-from . nixpkgs#niri
 
-      - name: OpenRouter (GLM 5.3) エージェントループで修正・検証・書き込みを行う
+      - name: モデルへの初回メッセージを構築（glm/pi両分岐が同じファイルを読む）
         if: steps.attempts.outputs.exhausted == 'false'
         run: |
           python3 <<'PYEOF'
@@ -183,13 +193,12 @@ jobs:
 
           sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "trusted", ".github", "scripts"))
           import ai_pipeline  # noqa: E402
-          import glm_agent  # noqa: E402
 
           runner_temp = os.environ["RUNNER_TEMP"]
           with open(os.path.join(runner_temp, "failure_log_tail.txt"), encoding="utf-8", errors="replace") as f:
               raw_failure_log = f.read()
           # CI失敗ログは信頼できない入力として扱う（ビルドされたコード自身がログに
-          # 任意の文字列を出力できる）。run_agent_loopに渡す前にsanitize_textを通す。
+          # 任意の文字列を出力できる）。モデルに渡す前にsanitize_textを通す。
           failure_log = ai_pipeline.sanitize_text(raw_failure_log, max_len=20000)
 
           initial_message = f"""以下はこのリポジトリのCI失敗ログです。list_dir / read_file で
@@ -199,20 +208,67 @@ jobs:
           {failure_log}
           """
 
+          # 分岐ごとに組み立て直すとglm版とpi版でモデルに渡る文面が食い違う。
+          # 構築はここ1箇所だけで行い、両分岐はこのファイルを読むだけにする。
+          with open(os.path.join(runner_temp, "initial_message.txt"), "w", encoding="utf-8") as f:
+              f.write(initial_message)
+          PYEOF
+
+      - name: OpenRouter (GLM 5.3) エージェントループで修正・検証・書き込みを行う
+        if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE != 'pi'
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import sys
+
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "trusted", ".github", "scripts"))
+          import glm_agent  # noqa: E402
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          with open(os.path.join(runner_temp, "initial_message.txt"), encoding="utf-8") as f:
+              initial_message = f.read()
+
           result = glm_agent.run_agent_loop(
               initial_message,
-              commit_trailer="AI-Autofix-Attempt: true",
+              commit_trailer=os.environ["AUTOFIX_TRAILER"],
           )
           if result["aborted"]:
               sys.exit(1)
 
           # 既存のautofixコミットメッセージ規約（"autofix: "プレフィックス）を維持する。
+          # pi分岐はこの書き換えを通らない——pi_run.shが--message-prefixをagent-submitへ
+          # 渡して同じ接頭辞を付けるため、ここも通すと"autofix: autofix: "になる。
           commit_msg_path = os.path.join(runner_temp, "commit_msg.txt")
           with open(commit_msg_path, encoding="utf-8") as f:
               commit_msg = f.read()
           with open(commit_msg_path, "w", encoding="utf-8") as f:
-              f.write(f"autofix: {commit_msg}")
+              f.write(f"{os.environ['AUTOFIX_PREFIX']}{commit_msg}")
           PYEOF
+
+      - name: Cachix（piのビルド用、読み取りのみ・pushなし）
+        if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE == 'pi'
+        uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          # check-light.ymlのAIブランチ側と同じ扱い：authTokenを渡さない＝読み取り専用。
+          # 既知のギャップ：現時点でpiのビルド成果物をこのキャッシュへpushする経路が
+          # 無いため、信頼済みワークフローから事前にpiをビルド・pushする仕組みを
+          # 作るまでは毎回キャッシュミスになる（計画v7の論点5）。
+
+      - name: pi ハーネスで修正・検証・書き込みを行う
+        if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE == 'pi'
+        # $RUNNER_TEMP/trusted配下＝mainのコピーから起動する。ワークスペース側の
+        # .github/scripts/を使うと、AIブランチが書き換えたpi_run.sh・pi_wrapper.ts・
+        # ai_pipeline.pyが自分への制約を外せてしまう（AGENTS.mdの不変条件）。
+        # submitが呼ばれずに終了した場合pi_run.sh自身がexit 1するため、glm分岐の
+        # `if result["aborted"]: sys.exit(1)` と同じようにジョブが失敗する。
+        run: |
+          "$RUNNER_TEMP/trusted/.github/scripts/pi_run.sh" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --runner-temp "$RUNNER_TEMP" \
+            --message-file "$RUNNER_TEMP/initial_message.txt" \
+            --commit-trailer "$AUTOFIX_TRAILER" \
+            --message-prefix "$AUTOFIX_PREFIX"
 
       - name: 実際の変更セットを許可リストに対して最終検証
         if: steps.attempts.outputs.exhausted == 'false'
