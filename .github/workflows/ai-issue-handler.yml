@@ -97,10 +97,101 @@ jobs:
         uses: actions/checkout@v4
         with: { ref: main, path: _trusted, persist-credentials: false }
 
+      - name: 使用エンジンを解決（明示指定が無ければissueの複雑性で自動選択）
+        id: resolve_engine
+        # `if:` は付けない（常に実行する）。スキップされたステップの outputs は空文字列に
+        # なるため（`steps.<id>.outputs.<x>` == ''）、条件を付けると下流3箇所の
+        # `steps.resolve_engine.outputs.engine` 比較が全て壊れる。
+        # job-level `env:`（このファイルのL58-63）はジョブ開始時に一度だけ評価されるので
+        # `steps.*.outputs.*` を参照できない。解決結果はstep-levelでのみ参照する。
+        env:
+          HANDLER_ENGINE_VAR: ${{ vars.AI_HANDLER_ENGINE }}
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import sys
+
+          sys.path.insert(0, "_trusted/.github/scripts")
+          import ai_pipeline  # noqa: E402
+          import glm_agent  # noqa: E402
+
+          # 分類用の軽量モデル。本番のエージェントループ（z-ai/glm-5.3）とは別物で、
+          # ここでは「simple/complex の一語」だけを返させる。
+          CLASSIFIER_MODEL = "z-ai/glm-5.3-flash"
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          configured = os.environ.get("HANDLER_ENGINE_VAR", "").strip()
+
+          if configured in ("glm", "pi"):
+              # 明示指定時は分類呼び出しを一切行わない（従来動作と完全に同一に保つ）。
+              engine = configured
+              reason = f"vars.AI_HANDLER_ENGINE={configured} の明示指定（自動分類なし）"
+          else:
+              # 未設定・auto・タイポはすべて自動分類に落とす。
+              with open(os.path.join(runner_temp, "issue_title.txt"), encoding="utf-8") as f:
+                  issue_title = ai_pipeline.sanitize_text(f.read(), max_len=300)
+              with open(os.path.join(runner_temp, "issue_body.txt"), encoding="utf-8") as f:
+                  issue_body = ai_pipeline.sanitize_text(f.read(), max_len=4000)
+
+              # 「初回メッセージを構築」ステップとは独立した専用のサニタイズ・呼び出し。
+              # sanitize_text が2回走るのは意図通り（あちらは両分岐が共有するため触らない）。
+              classify_prompt = (
+                  "次のNixOS設定リポジトリのissueに対応する作業の複雑性を判定してください。\n"
+                  "単一ファイルの自明な追加・削除なら simple、複数ファイルの調査や"
+                  "試行錯誤を伴うなら complex です。\n"
+                  "simple か complex のどちらか一語だけを出力してください。\n\n"
+                  f"--- タイトル ---\n{issue_title}\n\n"
+                  f"--- 本文 ---\n{issue_body}\n"
+              )
+
+              try:
+                  # HTTP呼び出しは既存ヘルパをそのまま再利用する（urllibの再実装はしない）。
+                  # _openrouter_request は環境から OPENROUTER_API_KEY を読む。job-level env:
+                  # で既に渡っているのでこのステップでも追加設定は不要。`tools` キーは不要。
+                  response = glm_agent._openrouter_request(
+                      {
+                          "model": CLASSIFIER_MODEL,
+                          "temperature": 0,
+                          "messages": [
+                              {
+                                  "role": "system",
+                                  "content": "あなたは作業量の分類器です。simple か complex の一語のみを返します。",
+                              },
+                              {"role": "user", "content": classify_prompt},
+                          ],
+                      }
+                  )
+                  verdict = (response["choices"][0]["message"].get("content") or "").strip()
+                  # 完全一致ではなく部分一致で見る。flashモデルは句読点や短い説明を
+                  # 付けてくることがあり、その場合に完全一致だと常にglm側へ落ちてしまう。
+                  # "complex" が見つからなければ安全側の glm に解決する。
+                  engine = "pi" if "complex" in verdict.lower() else "glm"
+                  reason = f"{CLASSIFIER_MODEL} の自動分類結果: {verdict!r}"
+              except Exception as exc:  # noqa: BLE001
+                  # 失敗時は必ず glm にフォールバックする（pi ではない）。pi分岐は
+                  # PI_MAX_TURNS/PI_MAX_TOOL_CALLS を実質無制限にし、job の
+                  # `timeout-minutes: 40` だけが歯止めになっている。分類呼び出しが
+                  # 不安定なときに予算無制限側へ倒すのは既存の安全設計と矛盾する。
+                  engine = "glm"
+                  reason = f"自動分類が失敗したため安全側の glm にフォールバック: {type(exc).__name__}: {exc}"
+
+          print(f"::notice::engine={engine} / {reason}")
+
+          # このファイルは後続のPR本文構築ステップが無条件に cat する（このステップも
+          # 無条件実行なので常に存在する）。
+          with open(os.path.join(runner_temp, "engine_resolution.txt"), "w", encoding="utf-8") as f:
+              f.write(f"使用エンジン: `{engine}`（{reason}）\n")
+
+          # GITHUB_OUTPUT には engine だけを書く（reason は改行や `=` を含みうるため
+          # key=value 形式に流し込めない）。
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"engine={engine}\n")
+          PYEOF
+
       - uses: cachix/install-nix-action@v27
 
       - name: Cachix（piのビルド用、読み取りのみ・pushなし）
-        if: vars.AI_HANDLER_ENGINE == 'pi'
+        if: steps.resolve_engine.outputs.engine == 'pi'
         uses: cachix/cachix-action@v15
         with:
           name: nixos-furubese-t480s-5gb
@@ -165,7 +256,7 @@ jobs:
           PYEOF
 
       - name: GLMエージェントループを実行し、許可パスへ書き込む
-        if: vars.AI_HANDLER_ENGINE != 'pi'
+        if: steps.resolve_engine.outputs.engine != 'pi'
         run: |
           python3 <<'PYEOF'
           import os
@@ -195,7 +286,7 @@ jobs:
           PYEOF
 
       - name: pi ハーネスで修正・検証・書き込みを行う
-        if: vars.AI_HANDLER_ENGINE == 'pi'
+        if: steps.resolve_engine.outputs.engine == 'pi'
         # _trusted/ はこのワークスペース内のサブディレクトリ（mainからのcheckout、上の
         # ".git/info/exclude" 登録でこのブランチからは追跡されない）。autofixの
         # $RUNNER_TEMP/trusted とは配置が異なるが、どちらも「mainからのcheckout」である
@@ -284,6 +375,8 @@ jobs:
             echo
             echo "---"
             echo "issue #${ISSUE_NUMBER} からAI（OpenRouter経由のGLM 5.3）が自動生成した変更です。"
+            # resolve_engine は無条件実行なのでこのファイルは常に存在する（`if:` 不要）。
+            cat "$RUNNER_TEMP/engine_resolution.txt"
             echo "AIはNixコードを直接生成しています。書き込み先パスは modules/ai/**, home/ai/**,"
             echo "tests/ai/** の直下に機械的に制限されていますが、これは能力のサンドボックスでは"
             echo "ありません。**マージ前に必ず全差分を人間がレビューしてください。**"
