@@ -1302,5 +1302,135 @@ class ResolveEngineVerdictTests(unittest.TestCase):
         self.assertEqual(patched.call_count, 1)
 
 
+# --- (j) the multi-file hint injected into the classification prompt ---------
+#
+# Regression test for the real misclassification of issue #102 (delete three
+# files across two directories) as `simple`. The classifier's system prompt
+# already said multiple files means complex; the cheap model simply did not
+# follow it. The fix adds a countable fact — "this body names N distinct paths,
+# here they are" — to the user message. The system prompt is deliberately
+# unchanged.
+
+# issue #102 の実際の本文（`gh issue view 102 --json body --jq .body`）。テストが
+# ネットワークに依存しないようリテラルで持つ。削除対象の3ファイルだけでなく、
+# 「置き換え先」として言及される4パスも含む本物のテキストであることが重要
+# （抽出器を現実の文面で較正するため）。
+ISSUE_102_BODY = """\
+ディレクトリ内に、もう使われていない設定ファイルが複数残っている。各ファイルの先頭コメントに理由が書かれているので確認の上、削除してほしい：
+
+- `modules/ai/bottle.nix` — `modules/ai/bottles.nix` に統合済みで中身は空
+- `home/ai/niri-config.kdl` — 現行の `home/ai/niri.kdl` に置き換え済みで、どこからも参照されていない
+- `home/ai/noctalia-settings.toml` — 人間管理の `home/noctalia-settings.toml` と重複しており、`home/ai/noctalia.nix` からも参照されていない
+
+削除してよいか不安な場合は、まず `grep -rn` 等でリポジトリ全体から各ファイル名への参照が本当に無いことを確認してから削除すること。
+"""
+
+# issue #102 が実際に名指ししている「削除対象」の3パス。
+ISSUE_102_DELETION_TARGETS = (
+    "modules/ai/bottle.nix",
+    "home/ai/niri-config.kdl",
+    "home/ai/noctalia-settings.toml",
+)
+
+_HINT_MARKER = "個の異なるファイルパスに言及しています"
+# ヒントが注入されなかったことの厳密な確認: ルール行の直後に出力形式の指示行が
+# 隣接していること（間に何も挟まっていないこと）。
+_UNINJECTED_ADJACENCY = "complex です。\nsimple か complex"
+
+
+class ExtractPathMentionsTests(unittest.TestCase):
+    """The backtick-quoted-path extractor, independent of any model call."""
+
+    def test_extracts_the_three_deletion_targets_of_issue_102(self):
+        paths = glm_agent.extract_path_mentions(ISSUE_102_BODY)
+        for target in ISSUE_102_DELETION_TARGETS:
+            self.assertIn(target, paths)
+        # 実文面に対する完全な期待値（出現順）。置き換え先として言及される4パスも
+        # 拾う——「触るファイル数」ではなく「本文が名指しするパス数」を数える仕様。
+        self.assertEqual(
+            paths,
+            [
+                "modules/ai/bottle.nix",
+                "modules/ai/bottles.nix",
+                "home/ai/niri-config.kdl",
+                "home/ai/niri.kdl",
+                "home/ai/noctalia-settings.toml",
+                "home/noctalia-settings.toml",
+                "home/ai/noctalia.nix",
+            ],
+        )
+
+    def test_command_fragments_and_extensionless_spans_are_not_paths(self):
+        # `grep -rn` は空白を含み拡張子も無い。issue #102の本文に実在する反例。
+        self.assertEqual(glm_agent.extract_path_mentions("まず `grep -rn` で確認"), [])
+        for text in ("`simple`", "`modules/ai`", "`nix-instantiate --parse`", "no backticks at all"):
+            with self.subTest(text=text):
+                self.assertEqual(glm_agent.extract_path_mentions(text), [])
+
+    def test_duplicates_collapse_and_order_is_first_appearance(self):
+        self.assertEqual(
+            glm_agent.extract_path_mentions("`b/x.nix` `a/y.kdl` `b/x.nix`"),
+            ["b/x.nix", "a/y.kdl"],
+        )
+
+    def test_empty_and_none_text(self):
+        self.assertEqual(glm_agent.extract_path_mentions(""), [])
+        self.assertEqual(glm_agent.extract_path_mentions(None), [])
+
+
+class ClassificationPathHintTests(unittest.TestCase):
+    """0 or 1 path → the prompt is untouched; 2+ → the countable fact is added."""
+
+    def _prompt_for(self, title, body):
+        calls = []
+        glm_agent.resolve_engine(
+            "", title, body, request_fn=_fake_classifier("simple", calls=calls)
+        )
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_zero_paths_leaves_the_prompt_unchanged(self):
+        prompt = self._prompt_for(
+            "nixpkgsのfooパッケージを追加してほしい",
+            "システムにfooを入れたい。設定場所は任せる。",
+        )["messages"][1]["content"]
+        self.assertNotIn(_HINT_MARKER, prompt)
+        self.assertIn(_UNINJECTED_ADJACENCY, prompt)
+
+    def test_one_path_is_still_a_no_op(self):
+        prompt = self._prompt_for(
+            "bottle.nixを消したい", "`modules/ai/bottle.nix` は中身が空なので削除してほしい。"
+        )["messages"][1]["content"]
+        self.assertEqual(len(glm_agent.extract_path_mentions(prompt)), 1)
+        self.assertNotIn(_HINT_MARKER, prompt)
+        self.assertIn(_UNINJECTED_ADJACENCY, prompt)
+
+    def test_issue_102_body_injects_the_count_and_every_path(self):
+        payload = self._prompt_for("不要になった設定ファイルの削除", ISSUE_102_BODY)
+        prompt = payload["messages"][1]["content"]
+        self.assertIn(f"7 {_HINT_MARKER}", prompt)
+        for target in ISSUE_102_DELETION_TARGETS:
+            self.assertIn(target, prompt.split("\n--- タイトル ---")[0])
+        self.assertIn("2つ以上のファイルまたはディレクトリに触れる作業は", prompt)
+        self.assertIn("通常 complex と判定してください", prompt)
+        self.assertNotIn(_UNINJECTED_ADJACENCY, prompt)
+        # systemプロンプトの文言は変更しない（注入先はuser messageのみ）。
+        self.assertEqual(
+            payload["messages"][0]["content"],
+            "あなたは作業量の分類器です。simple か complex の一語のみを返します。",
+        )
+
+    def test_two_paths_is_the_threshold(self):
+        prompt = self._prompt_for("t", "`a/b.nix` と `c/d.kdl` を消す")["messages"][1]["content"]
+        self.assertIn(f"2 {_HINT_MARKER}", prompt)
+
+    def test_paths_past_the_body_truncation_limit_are_not_counted(self):
+        # 抽出はサニタイズ後のテキストに対して行う。モデルが読まない部分のパスを
+        # 件数に数えると、ヒントが本文と食い違う。
+        body = ("x" * 4000) + " `a/b.nix` `c/d.kdl`"
+        prompt = self._prompt_for("t", body)["messages"][1]["content"]
+        self.assertNotIn(_HINT_MARKER, prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
