@@ -179,6 +179,20 @@ jobs:
       - uses: cachix/install-nix-action@v27
         if: steps.attempts.outputs.exhausted == 'false'
 
+      - name: Cachix（piのビルド用、読み取りのみ・pushなし）
+        if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE == 'pi'
+        uses: cachix/cachix-action@v15
+        with:
+          name: nixos-furubese-t480s-5gb
+          # check-light.ymlのAIブランチ側と同じ扱い：authTokenを渡さない＝読み取り専用。
+          # install-nix-action直後、かつ"niriをインストール"（nix profile install）より前に
+          # 置く必要がある——cachix-action自身のインストーラはnix-envを使うため、先に
+          # nix profile installでプロファイルを新形式に変換してしまうと
+          # "profile is incompatible with nix-env" で失敗する（実機で確認済み）。
+          # 既知のギャップ：現時点でpiのビルド成果物をこのキャッシュへpushする経路が
+          # 無いため、信頼済みワークフローから事前にpiをビルド・pushする仕組みを
+          # 作るまでは毎回キャッシュミスになる（計画v7の論点5）。
+
       - name: niriをインストール（run_commandのコールドラン回避。flake.lockのピンを使うため--inputs-from .必須）
         if: steps.attempts.outputs.exhausted == 'false'
         timeout-minutes: 5
@@ -244,16 +258,6 @@ jobs:
           with open(commit_msg_path, "w", encoding="utf-8") as f:
               f.write(f"{os.environ['AUTOFIX_PREFIX']}{commit_msg}")
           PYEOF
-
-      - name: Cachix（piのビルド用、読み取りのみ・pushなし）
-        if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE == 'pi'
-        uses: cachix/cachix-action@v15
-        with:
-          name: nixos-furubese-t480s-5gb
-          # check-light.ymlのAIブランチ側と同じ扱い：authTokenを渡さない＝読み取り専用。
-          # 既知のギャップ：現時点でpiのビルド成果物をこのキャッシュへpushする経路が
-          # 無いため、信頼済みワークフローから事前にpiをビルド・pushする仕組みを
-          # 作るまでは毎回キャッシュミスになる（計画v7の論点5）。
 
       - name: pi ハーネスで修正・検証・書き込みを行う
         if: steps.attempts.outputs.exhausted == 'false' && vars.AI_AUTOFIX_ENGINE == 'pi'
