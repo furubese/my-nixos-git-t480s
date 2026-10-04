@@ -1,6 +1,0 @@
-// 【重複解消（PRレビュー指摘）】
-//
-// issue #21 当時に作成した旧niri設定ファイル。現行のniri設定は home/ai/niri.kdl で、
-// home/ai/niri.nix が ~/.config/niri/config.kdl として配備している（唯一の配備経路）。
-// 本ファイルを参照するモジュールは存在しない（ディレクトリ検査で発見した重複ファイル）
-// ため、内容を削除した。niri設定は home/ai/niri.kdl を参照すること。
